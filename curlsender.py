@@ -1,1348 +1,1661 @@
+from __future__ import annotations
+
+import sys
+
+# Startup guards — run before any PySide6 import so errors are user-friendly
+if sys.version_info < (3, 10):
+    import ctypes as _ctypes, os as _os
+    _ver = ".".join(str(x) for x in sys.version_info[:3])
+    _msg = f"cURLsender requires Python 3.10 or newer.\n\nFound: {_ver}\n\nDownload a newer Python from python.org."
+    if _os.name == "nt":
+        try:
+            _ctypes.windll.user32.MessageBoxW(None, _msg, "cURLsender", 0x10)
+        except Exception:
+            pass
+    else:
+        print(_msg, file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import PySide6  # noqa: F401
+except ImportError:
+    import ctypes as _ctypes, os as _os
+    _py = sys.executable or "py -3"
+    _msg = f"PySide6 is not installed.\n\nRun:\n  {_py} -m pip install PySide6"
+    if _os.name == "nt":
+        try:
+            _ctypes.windll.user32.MessageBoxW(None, _msg, "cURLsender", 0x10)
+        except Exception:
+            pass
+    else:
+        print(_msg, file=sys.stderr)
+    sys.exit(1)
+
+import codecs
+import ctypes
+import json
+import re
+import shlex
 import subprocess
 import sys
-import threading
 import time
-import tkinter as tk
-import ctypes
-from tkinter import ttk
-from curlsender_core import (
-    APP_ID,
-    DEFAULT_GEOMETRY,
-    DEFAULT_THEME,
-    analyze_command,
-    load_preferences_data,
-    read_cached_command,
-    resolve_geometry_preference,
-    resolve_theme_preference,
-    save_preferences_data,
-    write_cached_command,
+from collections.abc import Collection, Iterable, Mapping
+from pathlib import Path
+from urllib.parse import urlparse
+
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSettings, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import (
+    QColor,
+    QCloseEvent,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QKeySequence,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+    QShortcut,
+    QTextCursor,
+    QTextFormat,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFrame,
+    QGraphicsDropShadowEffect,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLayout,
+    QLayoutItem,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QSizePolicy,
+    QStyle,
+    QStyleOption,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
 
-_MIN_WINDOW_SIZE = (1040, 720)
-_WINDOW_CORNER_RADIUS = 30
-_DIALOG_CORNER_RADIUS = 24
-_RESIZE_BORDER = 8
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
 
+CONTINUATION_RE = re.compile(r"[\\^`]\r?\n")
+GEOMETRY_RE = re.compile(r"\d+x\d+\+-?\d+\+-?\d+")
+
+CACHE_FILE = Path.home() / ".curlsender_last.txt"
+PREFS_FILE = Path.home() / ".curlsender_prefs.json"
+DEFAULT_GEOMETRY = "1220x820"
+DEFAULT_THEME = "dark"
+
+HEADER_FLAGS = {"-H", "--header"}
+DATA_FLAGS = {
+    "-d", "--data", "--data-ascii", "--data-binary", "--data-raw",
+    "--data-urlencode", "--json", "-F", "--form",
+}
+SENSITIVE_HEADER_PREFIXES = ("authorization:", "cookie:", "x-api-key:", "proxy-authorization:")
+
+
+def normalize_command(text: str) -> str:
+    return CONTINUATION_RE.sub(" ", text).strip()
+
+
+def find_unclosed_quote_line(text: str) -> int | None:
+    in_single = False
+    in_double = False
+    open_line: int | None = None
+    line = 1
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            line += 1
+            i += 1
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+                open_line = None
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\" and i + 1 < n:
+                if text[i + 1] == "\n":
+                    line += 1
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+                open_line = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            if text[i + 1] == "\n":
+                line += 1
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            open_line = line
+        elif ch == '"':
+            in_double = True
+            open_line = line
+        i += 1
+    return open_line if (in_single or in_double) else None
+
+
+def _option_value(token: str, flag: str) -> str | None:
+    prefix = f"{flag}="
+    if token.startswith(prefix):
+        return token[len(prefix):]
+    return None
+
+
+def analyze_command(raw: str) -> dict[str, object]:
+    normalized = normalize_command(raw)
+    analysis: dict[str, object] = {
+        "raw": raw, "normalized": normalized, "has_command": bool(normalized),
+        "valid": False, "error": None, "error_line": None, "tokens": [], "args": [],
+        "method": "GET", "host": "Awaiting URL", "header_count": 0, "has_body": False,
+        "has_output": False, "output_target": None, "has_verbose": False, "has_auth": False,
+        "is_curl": False, "chip_texts": [],
+        "detail_text": "Paste a curl command to populate the preflight.", "warning_count": 0,
+    }
+
+    if not normalized:
+        return analysis
+
+    try:
+        tokens = shlex.split(normalized, posix=True)
+    except ValueError as exc:
+        line_hint = find_unclosed_quote_line(raw)
+        detail = f"Preflight blocked: {exc}"
+        if line_hint is not None:
+            detail = f"{detail} (quote opens on line {line_hint})"
+        analysis["error"] = str(exc)
+        analysis["error_line"] = line_hint
+        analysis["detail_text"] = detail
+        return analysis
+
+    analysis["tokens"] = tokens
+    args = tokens[1:] if tokens and tokens[0].lower() == "curl" else tokens[:]
+    analysis["is_curl"] = bool(tokens and tokens[0].lower() == "curl")
+    analysis["args"] = args
+
+    if not args:
+        analysis["detail_text"] = "No arguments were found after 'curl'."
+        return analysis
+
+    method = None
+    header_count = 0
+    has_body = False
+    has_output = False
+    output_target = None
+    has_verbose = False
+    has_auth = False
+    sensitive_count = 0
+    url = None
+    i = 0
+
+    while i < len(args):
+        token = args[i]
+        next_token = args[i + 1] if i + 1 < len(args) else None
+
+        inline_method = _option_value(token, "--request")
+        inline_header = _option_value(token, "--header")
+        inline_output = _option_value(token, "--output")
+        inline_url = _option_value(token, "--url")
+
+        if token in ("-X", "--request"):
+            if next_token:
+                method = next_token.upper()
+                i += 2
+                continue
+        elif inline_method:
+            method = inline_method.upper()
+        elif token in ("-I", "--head"):
+            method = "HEAD"
+        elif token in HEADER_FLAGS:
+            if next_token:
+                header_count += 1
+                if next_token.lower().startswith(SENSITIVE_HEADER_PREFIXES):
+                    has_auth = True
+                    sensitive_count += 1
+                i += 2
+                continue
+        elif inline_header:
+            header_count += 1
+            if inline_header.lower().startswith(SENSITIVE_HEADER_PREFIXES):
+                has_auth = True
+                sensitive_count += 1
+        elif token in DATA_FLAGS:
+            has_body = True
+            i += 2 if next_token else 1
+            continue
+        elif any(token.startswith(f"{flag}=") for flag in DATA_FLAGS if flag.startswith("--")):
+            has_body = True
+        elif token in ("-o", "--output"):
+            has_output = True
+            output_target = next_token
+            i += 2 if next_token else 1
+            continue
+        elif inline_output:
+            has_output = True
+            output_target = inline_output
+        elif token == "-O":
+            has_output = True
+            output_target = "remote name"
+        elif token in ("-v", "--verbose"):
+            has_verbose = True
+        elif token == "--url":
+            if next_token:
+                url = next_token
+                i += 2
+                continue
+        elif inline_url:
+            url = inline_url
+        elif token.startswith(("http://", "https://")) and url is None:
+            url = token
+        elif not token.startswith("-") and url is None:
+            if "." in token or "/" in token:
+                url = token
+        i += 1
+
+    if method is None:
+        method = "POST" if has_body else "GET"
+
+    host = "Awaiting URL"
+    if url:
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+        host = parsed.netloc or parsed.path.split("/")[0] or "Awaiting URL"
+
+    chips = [method]
+    if host != "Awaiting URL":
+        chips.append(host)
+    if header_count:
+        chips.append(f"{header_count} header{'s' if header_count != 1 else ''}")
+    if has_body:
+        chips.append("Body detected")
+    if has_output:
+        chips.append("Output file")
+    if has_auth:
+        chips.append("Sensitive header")
+    if has_verbose:
+        chips.append("Verbose")
+
+    detail_parts = [f"{len(args)} arg{'s' if len(args) != 1 else ''} ready"]
+    if has_output and output_target:
+        detail_parts.append(f"writes to {output_target}")
+    if sensitive_count:
+        detail_parts.append(
+            f"{sensitive_count} sensitive header{'s' if sensitive_count != 1 else ''} will be cached locally"
+        )
+
+    analysis.update({
+        "valid": True, "args": args, "method": method, "host": host,
+        "header_count": header_count, "has_body": has_body, "has_output": has_output,
+        "output_target": output_target, "has_verbose": has_verbose, "has_auth": has_auth,
+        "warning_count": sensitive_count, "chip_texts": chips[:5],
+        "detail_text": " | ".join(detail_parts),
+    })
+    return analysis
+
+
+def load_preferences_data(prefs_file: Path = PREFS_FILE) -> dict[str, object]:
+    try:
+        data = json.loads(prefs_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_preferences_data(data: Mapping[str, object], prefs_file: Path = PREFS_FILE) -> None:
+    try:
+        prefs_file.write_text(json.dumps(dict(data), indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_session_data(prefs_file: Path = PREFS_FILE) -> dict[str, object]:
+    try:
+        prefs = load_preferences_data(prefs_file)
+        return prefs.get("session_data", {}) if isinstance(prefs.get("session_data"), dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_session_data(session: Mapping[str, object], prefs_file: Path = PREFS_FILE) -> None:
+    try:
+        prefs = load_preferences_data(prefs_file)
+        prefs["session_data"] = dict(session)
+        save_preferences_data(prefs, prefs_file)
+    except OSError:
+        pass
+
+
+def read_cached_command(cache_file: Path = CACHE_FILE) -> str:
+    try:
+        return cache_file.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def write_cached_command(raw: str, cache_file: Path = CACHE_FILE) -> None:
+    try:
+        cache_file.write_text(raw, encoding="utf-8")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Widgets
+# ---------------------------------------------------------------------------
+
+class FlowLayout(QLayout):
+    def __init__(self, parent: QWidget | None = None, *, h_spacing: int = 8, v_spacing: int = 8) -> None:
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self._h_spacing = h_spacing
+        self._v_spacing = v_spacing
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append(item)
+
+    def addItems(self, widgets: Iterable[QWidget]) -> None:
+        for widget in widgets:
+            self.addWidget(widget)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> QLayoutItem | None:
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int) -> QLayoutItem | None:
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> Qt.Orientations:
+        return Qt.Orientations()
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect: QRect, *, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        effective = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x, y, line_height = effective.x(), effective.y(), 0
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._h_spacing
+            if line_height > 0 and next_x - self._h_spacing > effective.right() + 1:
+                x = effective.x()
+                y += line_height + self._v_spacing
+                next_x = x + hint.width() + self._h_spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return max(y + line_height - rect.y() + margins.bottom(), 0)
+
+
+class _LineNumberArea(QWidget):
+    def __init__(self, editor: "CodeEditor") -> None:
+        super().__init__(editor)
+        self._editor = editor
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        self._editor.paint_line_number_area(event)
+
+
+class CodeEditor(QPlainTextEdit):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._line_number_area = _LineNumberArea(self)
+        self._colors: dict[str, str] = {
+            "editor_bg": "#0d1115", "editor_fg": "#d9e2e8",
+            "gutter_bg": "#11181d", "gutter_fg": "#5d7180",
+            "focus": "#5f9eff", "select_bg": "#32757f", "select_fg": "#0a1416",
+        }
+        self.blockCountChanged.connect(self.update_line_number_area_width)
+        self.updateRequest.connect(self.update_line_number_area)
+        self.cursorPositionChanged.connect(self.highlight_current_line)
+        self.verticalScrollBar().rangeChanged.connect(self._sync_scrollbar_visibility)
+        self.update_line_number_area_width(0)
+        self.highlight_current_line()
+        self._sync_scrollbar_visibility(0, 0)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" " * 4))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def line_number_area_width(self) -> int:
+        return 20 + self.fontMetrics().horizontalAdvance("9") * len(str(max(1, self.blockCount())))
+
+    def update_line_number_area_width(self, _block_count: int) -> None:
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def update_line_number_area(self, rect: QRect, dy: int) -> None:
+        if dy:
+            self._line_number_area.scroll(0, dy)
+        else:
+            self._line_number_area.update(0, rect.y(), self._line_number_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self.update_line_number_area_width(0)
+
+    def _sync_scrollbar_visibility(self, minimum: int, maximum: int) -> None:
+        self.verticalScrollBar().setVisible(maximum > minimum)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        contents = self.contentsRect()
+        self._line_number_area.setGeometry(
+            QRect(contents.left(), contents.top(), self.line_number_area_width(), contents.height())
+        )
+
+    def paint_line_number_area(self, event) -> None:
+        painter = QPainter(self._line_number_area)
+        painter.fillRect(event.rect(), QColor(self._colors["gutter_bg"]))
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = round(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+        current_line = self.textCursor().blockNumber()
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                color = QColor(self._colors["editor_fg"] if block_number == current_line else self._colors["gutter_fg"])
+                painter.setPen(color)
+                painter.drawText(
+                    0, top, self._line_number_area.width() - 10,
+                    self.fontMetrics().height(), Qt.AlignmentFlag.AlignRight, str(block_number + 1),
+                )
+            block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            block_number += 1
+
+    def highlight_current_line(self) -> None:
+        if self.isReadOnly():
+            self.setExtraSelections([])
+            return
+        selection = QTextEdit.ExtraSelection()
+        selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+        selection.format.setBackground(QColor(self._colors["focus"]).lighter(130))
+        selection.format.setForeground(QColor(self._colors["editor_fg"]))
+        selection.cursor = self.textCursor()
+        selection.cursor.clearSelection()
+        self.setExtraSelections([selection])
+
+    def apply_theme(self, colors: dict[str, str]) -> None:
+        self._colors = {**self._colors, **colors}
+        self._line_number_area.update()
+        self.highlight_current_line()
+        self.setStyleSheet(
+            "QPlainTextEdit {"
+            f"background: {self._colors['editor_bg']}; color: {self._colors['editor_fg']};"
+            "border: none; padding: 14px 16px 14px 0;"
+            f"selection-background-color: {self._colors['select_bg']};"
+            f"selection-color: {self._colors['select_fg']};"
+            "}"
+        )
+        self.viewport().update()
+
+
+class PaintableWidget(QWidget):
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        option = QStyleOption()
+        option.initFrom(self)
+        painter = QPainter(self)
+        self.style().drawPrimitive(QStyle.PrimitiveElement.PE_Widget, option, painter, self)
+        super().paintEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# App constants
+# ---------------------------------------------------------------------------
+
+_WINDOW_MARGIN = 18
+_WINDOW_RADIUS = 30
+_CARD_RADIUS = 24
+_RESIZE_MARGIN = 8
+_MIN_WINDOW_SIZE = QSize(1040, 720)
+_DEFAULT_WINDOW_SIZE = QSize(1220, 820)
+_SETTINGS_ORGANIZATION = "cURLsender"
+_SETTINGS_APPLICATION = "ConsoleSignal"
+_APP_ID = "cURLsender.App"
 _IS_WINDOWS = sys.platform.startswith("win")
-if _IS_WINDOWS:
-    _USER32 = ctypes.windll.user32
-    _GDI32 = ctypes.windll.gdi32
-    _SHELL32 = ctypes.windll.shell32
-    _GWL_EXSTYLE = -20
-    _WS_EX_APPWINDOW = 0x00040000
-    _WS_EX_TOOLWINDOW = 0x00000080
-    _SWP_NOSIZE = 0x0001
-    _SWP_NOMOVE = 0x0002
-    _SWP_NOZORDER = 0x0004
-    _SWP_NOACTIVATE = 0x0010
-    _SWP_FRAMECHANGED = 0x0020
 
 _THEMES = {
     "dark": {
-        "window_bg": "#11161a",
-        "shell_bg": "#151c21",
-        "shell_border": "#28333b",
-        "card_bg": "#1b242b",
-        "card_alt_bg": "#202a31",
-        "card_border": "#2f3b44",
-        "metric_bg": "#243039",
-        "text": "#eff3f6",
-        "muted": "#99a7b5",
-        "accent": "#3db497",
-        "accent_hover": "#4bc4a7",
-        "accent_text": "#071512",
-        "secondary_bg": "#24343c",
-        "secondary_hover": "#2c4049",
-        "secondary_text": "#d5edf1",
-        "ghost_bg": "#202930",
-        "ghost_hover": "#28333b",
-        "ghost_text": "#eff3f6",
-        "editor_bg": "#0d1115",
-        "editor_fg": "#d9e2e8",
-        "output_bg": "#0b0f13",
-        "output_fg": "#dce4ea",
-        "gutter_bg": "#11181d",
-        "gutter_fg": "#5d7180",
-        "select_bg": "#245c61",
-        "select_fg": "#ffffff",
-        "focus": "#5f9eff",
-        "good_bg": "#17362d",
-        "good_fg": "#7ee2a8",
-        "warn_bg": "#3e3217",
-        "warn_fg": "#ffd07d",
-        "bad_bg": "#422022",
-        "bad_fg": "#ff9898",
-        "chip_bg": "#18343c",
-        "chip_fg": "#9fe5f0",
-        "badge_bg": "#18343c",
-        "badge_fg": "#d5edf1",
-        "input_insert": "#7edcc5",
+        "window_bg": "#11161a", "shell_bg": "#151c21", "shell_border": "#28333b",
+        "card_bg": "#1b242b", "card_alt_bg": "#202a31", "card_border": "#2f3b44",
+        "metric_bg": "#243039", "text": "#eff3f6", "muted": "#99a7b5",
+        "accent": "#3db497", "accent_hover": "#4bc4a7", "accent_text": "#071512",
+        "secondary_bg": "#24343c", "secondary_hover": "#2c4049", "secondary_text": "#d5edf1",
+        "ghost_bg": "#202930", "ghost_hover": "#28333b", "ghost_text": "#eff3f6",
+        "editor_bg": "#0d1115", "editor_fg": "#d9e2e8",
+        "output_bg": "#0b0f13", "output_fg": "#dce4ea",
+        "gutter_bg": "#11181d", "gutter_fg": "#5d7180",
+        "select_bg": "#32757f", "select_fg": "#0a1416", "focus": "#5f9eff",
+        "good_bg": "#17362d", "good_fg": "#7ee2a8",
+        "warn_bg": "#3e3217", "warn_fg": "#ffd07d",
+        "bad_bg": "#422022", "bad_fg": "#ff9898",
+        "chip_bg": "#18343c", "chip_fg": "#9fe5f0",
+        "badge_bg": "#18343c", "badge_fg": "#d5edf1",
         "shadow": "#0c1014",
-        "titlebar_btn_bg": "#202930",
-        "titlebar_btn_hover": "#2a353d",
-        "titlebar_btn_fg": "#d5edf1",
-        "titlebar_close_hover": "#6b2f36",
-        "dialog_scrim": "#050709",
+        "titlebar_btn_bg": "#202930", "titlebar_btn_hover": "#2a353d",
+        "titlebar_btn_fg": "#d5edf1", "titlebar_close_hover": "#6b2f36",
+        "find_match_bg": "#245c61", "find_current_bg": "#3db497", "find_current_fg": "#071512",
+        "logo_start": "#3db497", "logo_end": "#5f9eff",
     },
     "light": {
-        "window_bg": "#ece4d4",
-        "shell_bg": "#f6efdf",
-        "shell_border": "#d8cfc0",
-        "card_bg": "#fff9f1",
-        "card_alt_bg": "#fffdf8",
-        "card_border": "#d9cfbe",
-        "metric_bg": "#eff7f5",
-        "text": "#1f2429",
-        "muted": "#697482",
-        "accent": "#135d66",
-        "accent_hover": "#197481",
-        "accent_text": "#ffffff",
-        "secondary_bg": "#d8ecef",
-        "secondary_hover": "#cce5e8",
-        "secondary_text": "#135d66",
-        "ghost_bg": "#ebe4d7",
-        "ghost_hover": "#e0d7c9",
-        "ghost_text": "#1f2429",
-        "editor_bg": "#11161a",
-        "editor_fg": "#d9e2e8",
-        "output_bg": "#10161a",
-        "output_fg": "#dce4ea",
-        "gutter_bg": "#171d22",
-        "gutter_fg": "#6a7b88",
-        "select_bg": "#32757f",
-        "select_fg": "#ffffff",
-        "focus": "#32757f",
-        "good_bg": "#d9f0e2",
-        "good_fg": "#1d7348",
-        "warn_bg": "#f6ead2",
-        "warn_fg": "#9a620f",
-        "bad_bg": "#f5dada",
-        "bad_fg": "#9f3d3d",
-        "chip_bg": "#e3f1f3",
-        "chip_fg": "#135d66",
-        "badge_bg": "#e3f1f3",
-        "badge_fg": "#135d66",
-        "input_insert": "#7edcc5",
+        "window_bg": "#ece4d4", "shell_bg": "#f6efdf", "shell_border": "#d8cfc0",
+        "card_bg": "#fff9f1", "card_alt_bg": "#fffdf8", "card_border": "#d9cfbe",
+        "metric_bg": "#eff7f5", "text": "#1f2429", "muted": "#697482",
+        "accent": "#135d66", "accent_hover": "#197481", "accent_text": "#ffffff",
+        "secondary_bg": "#d8ecef", "secondary_hover": "#cce5e8", "secondary_text": "#135d66",
+        "ghost_bg": "#ebe4d7", "ghost_hover": "#e0d7c9", "ghost_text": "#1f2429",
+        "editor_bg": "#11161a", "editor_fg": "#d9e2e8",
+        "output_bg": "#10161a", "output_fg": "#dce4ea",
+        "gutter_bg": "#171d22", "gutter_fg": "#6a7b88",
+        "select_bg": "#32757f", "select_fg": "#0a1416", "focus": "#32757f",
+        "good_bg": "#d9f0e2", "good_fg": "#1d7348",
+        "warn_bg": "#f6ead2", "warn_fg": "#9a620f",
+        "bad_bg": "#f5dada", "bad_fg": "#9f3d3d",
+        "chip_bg": "#e3f1f3", "chip_fg": "#135d66",
+        "badge_bg": "#e3f1f3", "badge_fg": "#135d66",
         "shadow": "#d5cab8",
-        "titlebar_btn_bg": "#ebe4d7",
-        "titlebar_btn_hover": "#e0d7c9",
-        "titlebar_btn_fg": "#1f2429",
-        "titlebar_close_hover": "#e9c9c9",
-        "dialog_scrim": "#7b7468",
+        "titlebar_btn_bg": "#ebe4d7", "titlebar_btn_hover": "#e0d7c9",
+        "titlebar_btn_fg": "#1f2429", "titlebar_close_hover": "#e9c9c9",
+        "find_match_bg": "#d8ecef", "find_current_bg": "#135d66", "find_current_fg": "#ffffff",
+        "logo_start": "#135d66", "logo_end": "#3f90a0",
     },
 }
 
 
-def attach_context_menu(text: tk.Text) -> None:
-    """Add a right-click menu to a Text widget."""
-    menu = tk.Menu(text, tearoff=0)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    def fire(event_name: str):
-        return lambda: text.event_generate(event_name)
+def _set_app_user_model_id(app_id: str) -> None:
+    if not _IS_WINDOWS:
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except OSError:
+        pass
 
-    def select_all() -> None:
-        text.tag_add("sel", "1.0", "end-1c")
-        text.focus_set()
 
-    menu.add_command(label="Undo", command=fire("<<Undo>>"))
-    menu.add_command(label="Redo", command=fire("<<Redo>>"))
-    menu.add_separator()
-    menu.add_command(label="Cut", command=fire("<<Cut>>"))
-    menu.add_command(label="Copy", command=fire("<<Copy>>"))
-    menu.add_command(label="Paste", command=fire("<<Paste>>"))
-    menu.add_separator()
-    menu.add_command(label="Select All", command=select_all)
+def _build_app_icon(theme_name: str = DEFAULT_THEME) -> QIcon:
+    colors = _THEMES[theme_name]
+    pixmap = QPixmap(128, 128)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    rect = QRectF(8, 8, 112, 112)
+    path = QPainterPath()
+    path.addRoundedRect(rect, 32, 32)
+    gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    gradient.setColorAt(0.0, QColor(colors["logo_start"]))
+    gradient.setColorAt(1.0, QColor(colors["logo_end"]))
+    painter.fillPath(path, gradient)
+    painter.setPen(Qt.PenStyle.NoPen)
+    inset = QRectF(28, 28, 72, 72)
+    inner = QPainterPath()
+    inner.addRoundedRect(inset, 24, 24)
+    painter.fillPath(inner, QColor(255, 255, 255, 32))
+    painter.setFont(QFont("Segoe UI", 58, QFont.Weight.Black))
+    painter.setPen(QColor("#ffffff"))
+    painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "c")
+    painter.end()
+    return QIcon(pixmap)
 
-    def show(event: tk.Event) -> str:
-        readonly = str(text.cget("state")) == "disabled"
-        has_sel = bool(text.tag_ranges("sel"))
-        undoable = bool(text.cget("undo")) and not readonly
-        menu.entryconfigure("Undo", state="normal" if undoable else "disabled")
-        menu.entryconfigure("Redo", state="normal" if undoable else "disabled")
-        menu.entryconfigure("Cut", state="normal" if (has_sel and not readonly) else "disabled")
-        menu.entryconfigure("Copy", state="normal" if has_sel else "disabled")
-        menu.entryconfigure("Paste", state="disabled" if readonly else "normal")
+
+def _format_rate(byte_count: int, seconds: float | None) -> str:
+    if not seconds or seconds <= 0 or byte_count <= 0:
+        return "-"
+    units = ["B/s", "KB/s", "MB/s", "GB/s"]
+    rate = byte_count / seconds
+    i = 0
+    while rate >= 1024 and i < len(units) - 1:
+        rate /= 1024
+        i += 1
+    return f"{rate:.{1 if rate < 10 and i > 0 else 0}f} {units[i]}"
+
+
+def _font_stack(size: int, *, monospace: bool = False, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    font = QFont("Cascadia Code" if monospace else "Segoe UI", size)
+    font.setWeight(weight)
+    return font
+
+
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+
+class CurlRunWorker(QObject):
+    chunk = Signal(str, int)
+    failed = Signal(str)
+    finished = Signal(int, float, bool, int)
+
+    def __init__(self, args: list[str]) -> None:
+        super().__init__()
+        self._args = args
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._cancel_requested = False
+
+    @Slot()
+    def run(self) -> None:
+        started_at = time.monotonic()
         try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-        return "break"
+            self._proc = subprocess.Popen(
+                ["curl", *self._args],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, text=False, bufsize=0,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except FileNotFoundError:
+            self.failed.emit("'curl' not found on PATH. Windows 10 (1803+) and Windows 11 ship curl.exe in System32.")
+            return
+        except OSError as exc:
+            self.failed.emit(str(exc))
+            return
 
-    text.bind("<Button-3>", show)
-class NumberedText(ttk.Frame):
-    GUTTER_WIDTH = 44
-    GUTTER_PAD = 8
+        assert self._proc.stdout is not None
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        total_bytes = 0
 
-    def __init__(self, parent: tk.Misc, *, readonly: bool = False, **text_kwargs) -> None:
+        while True:
+            if self._cancel_requested and self._proc.poll() is None:
+                try:
+                    self._proc.terminate()
+                except OSError:
+                    pass
+            try:
+                chunk = self._proc.stdout.read1(4096)  # type: ignore[attr-defined]
+            except AttributeError:
+                chunk = self._proc.stdout.read(4096)
+            if chunk:
+                total_bytes += len(chunk)
+                decoded = decoder.decode(chunk)
+                if decoded:
+                    self.chunk.emit(decoded, len(chunk))
+                continue
+            return_code = self._proc.poll()
+            if return_code is not None:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    total_bytes += len(tail.encode("utf-8", errors="replace"))
+                    self.chunk.emit(tail, len(tail.encode("utf-8", errors="replace")))
+                self.finished.emit(return_code, time.monotonic() - started_at,
+                                   self._cancel_requested and return_code != 0, total_bytes)
+                return
+            time.sleep(0.02)
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# UI components
+# ---------------------------------------------------------------------------
+
+class LogoBadge(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._font = text_kwargs.get("font", ("Consolas", 10))
-        self._readonly = readonly
-        self._gutter_fg = "#808080"
-        self._scrollbar_visible = True
-
-        self.text = tk.Text(self, borderwidth=0, relief="flat", **text_kwargs)
-        self.gutter = tk.Canvas(
-            self,
-            width=self.GUTTER_WIDTH,
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        self.scrollbar = ttk.Scrollbar(self, command=self._on_scrollbar, style="Signal.Vertical.TScrollbar")
-        self.text.configure(yscrollcommand=self._on_textscroll)
-
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-
-        self.gutter.grid(row=0, column=0, sticky="ns")
-        self.text.grid(row=0, column=1, sticky="nsew")
-        self.scrollbar.grid(row=0, column=2, sticky="ns")
-
-        self.text.bind("<<Modified>>", self._on_modified, add="+")
-        self.text.bind("<Configure>", lambda _event: self._redraw(), add="+")
-        self.text.bind("<KeyRelease>", lambda _event: self._redraw(), add="+")
-        self.text.bind("<MouseWheel>", lambda _event: self.after_idle(self._redraw), add="+")
-        self.text.bind("<Button-4>", lambda _event: self.after_idle(self._redraw), add="+")
-        self.text.bind("<Button-5>", lambda _event: self.after_idle(self._redraw), add="+")
+        self.setFixedSize(52, 52)
+        self._colors = _THEMES[DEFAULT_THEME]
 
     def apply_theme(self, colors: dict[str, str]) -> None:
-        self.configure(style="EditorShell.TFrame")
-        self.gutter.configure(bg=colors["gutter_bg"])
-        self.text.configure(
-            background=colors["editor_bg"] if not self._readonly else colors["output_bg"],
-            foreground=colors["editor_fg"] if not self._readonly else colors["output_fg"],
-            insertbackground=colors["input_insert"],
-            selectbackground=colors["select_bg"],
-            selectforeground=colors["select_fg"],
-            highlightthickness=0,
-            padx=0,
-            pady=12,
+        self._colors = colors
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        gradient.setColorAt(0.0, QColor(self._colors["logo_start"]))
+        gradient.setColorAt(1.0, QColor(self._colors["logo_end"]))
+        path = QPainterPath()
+        path.addRoundedRect(rect, 16, 16)
+        painter.fillPath(path, gradient)
+        painter.setPen(QColor("#ffffff"))
+        painter.setFont(QFont("Segoe UI", 30, QFont.Weight.Black))
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "c")
+        painter.end()
+
+
+class TitleBar(PaintableWidget):
+    def __init__(self, host: "ConsoleSignalWindow") -> None:
+        super().__init__(host)
+        self._host = host
+        self.setObjectName("TitleBar")
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            if not isinstance(self.childAt(event.position().toPoint()), QPushButton):
+                self._host.begin_title_drag(event.globalPosition().toPoint())
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._host.toggle_maximized()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class MetricCard(QFrame):
+    def __init__(self, title: str, value: str = "-") -> None:
+        super().__init__()
+        self.setProperty("cardRole", "metric")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(6)
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("MetricTitle")
+        self.title_label.setFont(_font_stack(10, weight=QFont.Weight.Medium))
+        self.value_label = QLabel(value)
+        self.value_label.setObjectName("MetricValue")
+        self.value_label.setFont(_font_stack(14, weight=QFont.Weight.Bold))
+        self.value_label.setWordWrap(True)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.value_label)
+        layout.addStretch(1)
+
+    def set_value(self, value: str) -> None:
+        self.value_label.setText(value)
+
+    def set_variant(self, variant: str) -> None:
+        self.setProperty("variant", variant)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class OutputEditor(CodeEditor):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        self._highlight_selections: list[QTextEdit.ExtraSelection] = []
+        super().__init__(parent)
+        self.setReadOnly(True)
+
+    def highlight_current_line(self) -> None:
+        self.setExtraSelections(self._highlight_selections)
+
+    def set_highlight_selections(self, selections) -> None:
+        self._highlight_selections = list(selections)
+        self.setExtraSelections(self._highlight_selections)
+
+    def apply_theme(self, colors: dict[str, str]) -> None:
+        self._colors = {**self._colors, **colors}
+        self._line_number_area.update()
+        self.setStyleSheet(
+            "QPlainTextEdit {"
+            f"background: {self._colors['output_bg']}; color: {self._colors['output_fg']};"
+            "border: none; padding: 14px 16px 14px 0;"
+            f"selection-background-color: {self._colors['select_bg']};"
+            f"selection-color: {self._colors['select_fg']};"
+            "}"
         )
-        self._gutter_fg = colors["gutter_fg"]
-        self.after_idle(self._redraw)
-
-    def _on_textscroll(self, first: str, last: str) -> None:
-        self.scrollbar.set(first, last)
-        should_show = not (float(first) <= 0.0 and float(last) >= 1.0)
-        if should_show != self._scrollbar_visible:
-            self._scrollbar_visible = should_show
-            if should_show:
-                self.scrollbar.grid()
-            else:
-                self.scrollbar.grid_remove()
-        self._redraw()
-
-    def _on_scrollbar(self, *args) -> None:
-        self.text.yview(*args)
-        self._redraw()
-
-    def _on_modified(self, _event: tk.Event) -> None:
-        self._redraw()
-        self.text.edit_modified(False)
-
-    def _redraw(self) -> None:
-        self.gutter.delete("all")
-        x = self.GUTTER_WIDTH - self.GUTTER_PAD
-        i = self.text.index("@0,0")
-        while True:
-            dline = self.text.dlineinfo(i)
-            if dline is None:
-                break
-            lineno = i.split(".")[0]
-            self.gutter.create_text(
-                x,
-                dline[1],
-                anchor="ne",
-                text=lineno,
-                font=self._font,
-                fill=self._gutter_fg,
-            )
-            i = self.text.index(f"{i}+1line")
+        self.viewport().update()
+        self.highlight_current_line()
 
 
-class CurlSenderApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("cURLsender")
-        self.prefs = self._load_preferences_data()
+class ExitDialog(QDialog):
+    def __init__(self, parent: QWidget, colors: dict[str, str], *, running: bool) -> None:
+        super().__init__(parent)
+        self.setModal(True)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._colors = colors
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 18)
+        self.surface = QFrame()
+        self.surface.setObjectName("ExitDialogSurface")
+        outer.addWidget(self.surface)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(36)
+        shadow.setOffset(0, 12)
+        shadow.setColor(QColor(colors["shadow"]))
+        self.surface.setGraphicsEffect(shadow)
+
+        layout = QVBoxLayout(self.surface)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(18)
+
+        title = QLabel("Close cURLsender?")
+        title.setFont(_font_stack(15, weight=QFont.Weight.Bold))
+        layout.addWidget(title)
+
+        body = QLabel(
+            "Closing now will cancel the current execution and preserve whatever output has already arrived."
+            if running else "You can reopen cURLsender anytime."
+        )
+        body.setWordWrap(True)
+        body.setObjectName("DialogBody")
+        body.setFont(_font_stack(11))
+        layout.addWidget(body)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        buttons.addStretch(1)
+        stay_btn = QPushButton("Stay here")
+        stay_btn.setProperty("variant", "ghost")
+        stay_btn.clicked.connect(self.reject)
+        exit_btn = QPushButton("Exit app")
+        exit_btn.setProperty("variant", "primary")
+        exit_btn.clicked.connect(self.accept)
+        buttons.addWidget(stay_btn)
+        buttons.addWidget(exit_btn)
+        layout.addLayout(buttons)
+
+        self.setStyleSheet(f"""
+            QFrame#ExitDialogSurface {{
+                background: {colors['card_bg']}; border: 1px solid {colors['card_border']};
+                border-radius: {_CARD_RADIUS}px;
+            }}
+            QLabel {{ color: {colors['text']}; }}
+            QLabel#DialogBody {{ color: {colors['muted']}; }}
+            QPushButton {{
+                border: 1px solid transparent; border-radius: 14px;
+                padding: 10px 14px; font: 600 11pt "Segoe UI";
+            }}
+            QPushButton[variant="primary"] {{ background: {colors['accent']}; color: {colors['accent_text']}; }}
+            QPushButton[variant="primary"]:hover {{ background: {colors['accent_hover']}; }}
+            QPushButton[variant="ghost"] {{ background: {colors['ghost_bg']}; color: {colors['ghost_text']}; }}
+            QPushButton[variant="ghost"]:hover {{ background: {colors['ghost_hover']}; }}
+        """)
+        self.resize(420, 220)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        ring_inset = 10 - 12
+        rect = self.rect().adjusted(ring_inset, ring_inset, -ring_inset, -ring_inset)
+        painter.setBrush(QColor(self._colors["shell_border"]))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(rect, 34, 34)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class ConsoleSignalWindow(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings = QSettings(_SETTINGS_ORGANIZATION, _SETTINGS_APPLICATION)
         self.current_theme = self._load_theme_preference()
-        self._last_normal_geometry = self._load_geometry_preference()
-        self.root.geometry(self._last_normal_geometry)
-        self.root.minsize(*_MIN_WINDOW_SIZE)
-        self.proc: subprocess.Popen | None = None
-        self.auto_scroll = True
-        self.cancel_requested = False
+        self.colors = _THEMES[self.current_theme]
+        self.command_analysis = analyze_command("")
+        self.command_restored = False
         self.run_state = "idle"
         self.run_started_at: float | None = None
         self.last_elapsed: float | None = None
         self.last_exit_code: int | None = None
-        self.command_restored = False
-        self.command_analysis = analyze_command("")
-        self._drag_origin: tuple[int, int] | None = None
-        self._resize_origin: dict[str, int | str] | None = None
-        self._resize_handles: list[tk.Frame] = []
-        self._geometry_job: str | None = None
-        self._restore_borderless_after_map = False
-        self._borderless_enabled = False
-        self._window_handle: int | None = None
-        self._close_dialog: tk.Toplevel | None = None
-        self._icon_images: list[tk.PhotoImage] = []
-        self._find_bar_visible = False
-        self._find_matches: list[tuple[str, str]] = []
+        self.cancel_requested = False
+        self.auto_scroll = self._load_bool("output/autoScroll", True)
+        self._find_positions: list[int] = []
         self._find_index = -1
-        self._suspend_geometry_save = True
+        self._close_after_finish = False
+        self._allow_close = False
+        self._worker: CurlRunWorker | None = None
+        self._worker_thread: QThread | None = None
+        self._bytes_received = 0
+        self._drag_origin: QPoint | None = None
+        self._drag_start_frame: QPoint | None = None
+        self._manual_resize_edges = Qt.Edges()
+        self._manual_resize_origin: QPoint | None = None
+        self._manual_resize_geometry = self.geometry()
 
-        self.status_var = tk.StringVar(value="Idle")
-        self.elapsed_var = tk.StringVar(value="-")
-        self.target_var = tk.StringVar(value="Awaiting URL")
-        self.result_var = tk.StringVar(value="No run yet")
-        self.summary_note_var = tk.StringVar(value="Paste a curl command to populate the preflight.")
-        self.action_meta_var = tk.StringVar(value="Ctrl+Enter executes. Output remains raw.")
-        self.stream_title_var = tk.StringVar(value="Signal Stream")
-        self.find_query_var = tk.StringVar(value="")
-        self.find_query_var.trace_add("write", self._on_find_query_change)
+        self.setWindowTitle("cURLsender")
+        self.setMinimumSize(_MIN_WINDOW_SIZE)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.installEventFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+        self.elapsed_timer = QTimer(self)
+        self.elapsed_timer.setInterval(150)
+        self.elapsed_timer.timeout.connect(self._tick_elapsed)
 
         self._build_ui()
-        self._install_window_icon()
-        self._configure_window_chrome()
-        self._apply_theme(self.current_theme)
-        self._load_last()
+        self._restore_window()
+        self._load_last_command()
+        self._restore_session()
+        self._apply_theme(self.current_theme, persist=False)
         self._refresh_command_analysis()
-        self._sync_ui_state(force_defaults=True)
-        self.root.after_idle(self._finalize_window_setup)
+
+        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.on_execute)
+        QShortcut(QKeySequence("Ctrl+Enter"), self, activated=self.on_execute)
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=self.toggle_find_bar)
+        QShortcut(QKeySequence("Esc"), self, activated=self.handle_escape)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        if self.isMaximized():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        ring_inset = _WINDOW_MARGIN - 16
+        rect = self.rect().adjusted(ring_inset, ring_inset, -ring_inset, -ring_inset)
+        painter.setBrush(QColor(self.colors["shell_border"]))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(rect, _WINDOW_RADIUS + 14, _WINDOW_RADIUS + 14)
 
     def _build_ui(self) -> None:
-        mono = ("Consolas", 10)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(_WINDOW_MARGIN, _WINDOW_MARGIN, _WINDOW_MARGIN, _WINDOW_MARGIN)
 
-        self.style = ttk.Style(self.root)
-        self.style.theme_use("clam")
+        self.surface = PaintableWidget()
+        self.surface.setObjectName("Surface")
+        self.surface.setMouseTracking(True)
+        root.addWidget(self.surface)
 
-        self.root.option_add("*tearOff", False)
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_rowconfigure(0, weight=1)
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(34)
+        shadow.setOffset(0, 14)
+        shadow.setColor(QColor(self.colors["shadow"]))
+        self.surface.setGraphicsEffect(shadow)
+        self._shadow_effect = shadow
 
-        self.shell = ttk.Frame(self.root, style="Shell.TFrame", padding=20)
-        self.shell.grid(row=0, column=0, sticky="nsew")
-        self.shell.grid_columnconfigure(0, weight=1)
-        self.shell.grid_rowconfigure(0, weight=1)
+        surface_layout = QVBoxLayout(self.surface)
+        surface_layout.setContentsMargins(26, 26, 26, 26)
+        surface_layout.setSpacing(18)
 
-        self.app_frame = ttk.Frame(self.shell, style="App.TFrame", padding=18)
-        self.app_frame.grid(row=0, column=0, sticky="nsew")
-        self.app_frame.grid_columnconfigure(0, weight=1)
-        self.app_frame.grid_rowconfigure(1, weight=1)
+        self.title_bar = TitleBar(self)
+        title_layout = QHBoxLayout(self.title_bar)
+        title_layout.setContentsMargins(20, 18, 20, 18)
+        title_layout.setSpacing(18)
 
-        self.header = ttk.Frame(self.app_frame, style="Card.TFrame", padding=(14, 12))
-        self.header.grid(row=0, column=0, sticky="ew")
-        self.header.grid_columnconfigure(0, weight=1)
+        brand_layout = QHBoxLayout()
+        brand_layout.setSpacing(14)
+        self.logo = LogoBadge()
+        brand_layout.addWidget(self.logo, 0, Qt.AlignmentFlag.AlignTop)
 
-        brand = ttk.Frame(self.header, style="Card.TFrame")
-        brand.grid(row=0, column=0, sticky="w")
+        brand_text_layout = QVBoxLayout()
+        brand_text_layout.setSpacing(4)
+        self.brand_title = QLabel("cURLsender / Console Signal")
+        self.brand_title.setObjectName("BrandTitle")
+        self.brand_title.setFont(_font_stack(18, weight=QFont.Weight.Bold))
+        self.brand_subtitle = QLabel("Desktop shell for faithful curl execution with rounded desktop polish.")
+        self.brand_subtitle.setObjectName("BrandSubtitle")
+        self.brand_subtitle.setFont(_font_stack(11))
+        brand_text_layout.addWidget(self.brand_title)
+        brand_text_layout.addWidget(self.brand_subtitle)
+        brand_layout.addLayout(brand_text_layout, 1)
+        title_layout.addLayout(brand_layout, 1)
 
-        self.logo = tk.Label(
-            brand,
-            text="c",
-            width=2,
-            font=("Segoe UI Semibold", 18),
-            bd=0,
-            padx=10,
-            pady=4,
-        )
-        self.logo.pack(side="left", padx=(0, 12))
+        header_actions = QHBoxLayout()
+        header_actions.setSpacing(10)
+        self.theme_btn = QPushButton()
+        self.theme_btn.setProperty("variant", "ghost")
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        self.status_badge = QLabel()
+        self.status_badge.setObjectName("StatusBadge")
+        self.status_badge.setFixedHeight(34)
+        self.status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.minimize_btn = QPushButton("_")
+        self.minimize_btn.setProperty("titleRole", "minimize")
+        self.minimize_btn.clicked.connect(self.showMinimized)
+        self.close_btn = QPushButton("X")
+        self.close_btn.setProperty("titleRole", "close")
+        self.close_btn.clicked.connect(self.request_close)
+        for btn in (self.theme_btn, self.minimize_btn, self.close_btn):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        header_actions.addWidget(self.theme_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        header_actions.addWidget(self.status_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        header_actions.addWidget(self.minimize_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        header_actions.addWidget(self.close_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_layout.addLayout(header_actions)
+        surface_layout.addWidget(self.title_bar)
 
-        title_block = ttk.Frame(brand, style="Card.TFrame")
-        title_block.pack(side="left")
-        ttk.Label(title_block, text="cURLsender / Console Signal", style="Brand.TLabel").pack(anchor="w")
-        ttk.Label(
-            title_block,
-            text="Paste, run, and read exactly what curl emits.",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
+        body = QWidget()
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(18)
+        surface_layout.addWidget(body, 1)
 
-        header_right = ttk.Frame(self.header, style="Card.TFrame")
-        header_right.grid(row=0, column=1, sticky="e")
+        left_column = QWidget()
+        left_layout = QVBoxLayout(left_column)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(18)
+        right_column = QWidget()
+        right_layout = QVBoxLayout(right_column)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(18)
+        body_layout.addWidget(left_column, 10)
+        body_layout.addWidget(right_column, 11)
 
-        self.theme_btn = ttk.Button(header_right, command=self.toggle_theme, style="Ghost.TButton")
-        self.theme_btn.pack(side="left", padx=(0, 10))
+        # Command card
+        self.command_card = self._create_card("default")
+        command_layout = QVBoxLayout(self.command_card)
+        command_layout.setContentsMargins(20, 18, 20, 18)
+        command_layout.setSpacing(16)
+        left_layout.addWidget(self.command_card, 1)
+        command_title = QLabel("COMMAND DECK")
+        command_title.setObjectName("SectionTitle")
+        command_title.setFont(_font_stack(11, weight=QFont.Weight.Bold))
+        command_layout.addWidget(command_title)
+        self.command_editor = CodeEditor()
+        self.command_editor.setFont(_font_stack(11, monospace=True, weight=QFont.Weight.Medium))
+        self.command_editor.setLineWrapMode(CodeEditor.LineWrapMode.WidgetWidth)
+        self.command_editor.textChanged.connect(self._refresh_command_analysis)
+        command_layout.addWidget(self.command_editor, 1)
+        self.preflight_wrap = QWidget()
+        self.preflight_layout = FlowLayout(self.preflight_wrap, h_spacing=8, v_spacing=8)
+        self.preflight_layout.setContentsMargins(0, 0, 0, 0)
+        command_layout.addWidget(self.preflight_wrap)
+        self.preflight_note = QLabel("Paste a curl command to populate the preflight.")
+        self.preflight_note.setObjectName("PreflightNote")
+        self.preflight_note.setWordWrap(True)
+        self.preflight_note.setFont(_font_stack(10))
+        command_layout.addWidget(self.preflight_note)
 
-        self.status_badge = tk.Label(header_right, padx=12, pady=7, bd=0, font=("Segoe UI Semibold", 10))
-        self.status_badge.pack(side="left", padx=(0, 10))
+        # Action card
+        self.action_card = self._create_card("alt")
+        action_layout = QVBoxLayout(self.action_card)
+        action_layout.setContentsMargins(20, 16, 20, 16)
+        action_layout.setSpacing(12)
+        left_layout.addWidget(self.action_card)
+        btn_row_top = QHBoxLayout()
+        btn_row_top.setSpacing(10)
+        self.execute_btn = QPushButton("Execute")
+        self.execute_btn.setProperty("variant", "primary")
+        self.execute_btn.clicked.connect(self.on_execute)
+        self.validate_btn = QPushButton("Validate only")
+        self.validate_btn.setProperty("variant", "secondary")
+        self.validate_btn.clicked.connect(self.on_validate)
+        btn_row_top.addWidget(self.execute_btn)
+        btn_row_top.addWidget(self.validate_btn)
+        btn_row_top.addStretch(1)
+        action_layout.addLayout(btn_row_top)
+        btn_row_bottom = QHBoxLayout()
+        btn_row_bottom.setSpacing(10)
+        self.clear_output_btn = QPushButton("Clear output")
+        self.clear_output_btn.setProperty("variant", "ghost")
+        self.clear_output_btn.clicked.connect(self.on_clear_output)
+        self.clear_all_btn = QPushButton("Clear all")
+        self.clear_all_btn.setProperty("variant", "ghost")
+        self.clear_all_btn.clicked.connect(self.on_clear_all)
+        btn_row_bottom.addWidget(self.clear_output_btn)
+        btn_row_bottom.addWidget(self.clear_all_btn)
+        btn_row_bottom.addStretch(1)
+        action_layout.addLayout(btn_row_bottom)
+        for btn in (self.execute_btn, self.validate_btn, self.clear_output_btn, self.clear_all_btn):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.action_meta = QLabel("Use Esc to cancel current execution.")
+        self.action_meta.setObjectName("ActionMeta")
+        self.action_meta.setWordWrap(True)
+        self.action_meta.setFont(_font_stack(11))
+        action_layout.addWidget(self.action_meta)
 
-        self.minimize_btn = tk.Label(
-            header_right,
-            text="_",
-            width=3,
-            padx=0,
-            pady=5,
-            bd=0,
-            cursor="hand2",
-            font=("Segoe UI Semibold", 11),
-        )
-        self.minimize_btn.pack(side="left", padx=(0, 8))
+        # Summary card
+        self.summary_card = self._create_card("default")
+        summary_layout = QVBoxLayout(self.summary_card)
+        summary_layout.setContentsMargins(20, 18, 20, 18)
+        summary_layout.setSpacing(16)
+        right_layout.addWidget(self.summary_card)
+        summary_title = QLabel("EXECUTION SUMMARY")
+        summary_title.setObjectName("SectionTitle")
+        summary_title.setFont(_font_stack(11, weight=QFont.Weight.Bold))
+        summary_layout.addWidget(summary_title)
+        metric_grid = QGridLayout()
+        metric_grid.setHorizontalSpacing(14)
+        metric_grid.setVerticalSpacing(14)
+        summary_layout.addLayout(metric_grid)
+        self.metric_status = MetricCard("Status", "Idle")
+        self.metric_elapsed = MetricCard("Elapsed", "-")
+        self.metric_rate = MetricCard("Rate", "-")
+        self.metric_exit = MetricCard("Exit", "No run yet")
+        self.metric_cards = [self.metric_status, self.metric_elapsed, self.metric_rate, self.metric_exit]
+        for idx, card in enumerate(self.metric_cards):
+            metric_grid.addWidget(card, 0, idx)
 
-        self.close_btn = tk.Label(
-            header_right,
-            text="X",
-            width=3,
-            padx=0,
-            pady=5,
-            bd=0,
-            cursor="hand2",
-            font=("Segoe UI Semibold", 10),
-        )
-        self.close_btn.pack(side="left")
+        # Output card
+        self.output_card = self._create_card("default")
+        output_layout = QVBoxLayout(self.output_card)
+        output_layout.setContentsMargins(20, 18, 20, 18)
+        output_layout.setSpacing(14)
+        right_layout.addWidget(self.output_card, 1)
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(10)
+        self.output_title = QLabel("SIGNAL STREAM")
+        self.output_title.setObjectName("SectionTitle")
+        self.output_title.setFont(_font_stack(11, weight=QFont.Weight.Bold))
+        toolbar.addWidget(self.output_title)
+        toolbar.addStretch(1)
+        self.find_btn = QPushButton("Find")
+        self.find_btn.setProperty("variant", "ghost")
+        self.find_btn.setProperty("toolbarRole", True)
+        self.find_btn.clicked.connect(self.toggle_find_bar)
+        self.jump_btn = QPushButton("Jump to end")
+        self.jump_btn.setProperty("variant", "ghost")
+        self.jump_btn.setProperty("toolbarRole", True)
+        self.jump_btn.clicked.connect(self.jump_to_end)
+        self.auto_scroll_btn = QPushButton("Auto-scroll on")
+        self.auto_scroll_btn.setProperty("variant", "ghost")
+        self.auto_scroll_btn.setProperty("toolbarRole", True)
+        self.auto_scroll_btn.clicked.connect(self.toggle_auto_scroll)
+        self.copy_btn = QPushButton("Copy output")
+        self.copy_btn.setProperty("variant", "ghost")
+        self.copy_btn.setProperty("toolbarRole", True)
+        self.copy_btn.clicked.connect(self.copy_output)
+        for btn in (self.find_btn, self.jump_btn, self.auto_scroll_btn, self.copy_btn):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            toolbar.addWidget(btn)
+        output_layout.addLayout(toolbar)
 
-        content = ttk.Frame(self.app_frame, style="App.TFrame")
-        content.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
-        content.grid_columnconfigure(0, weight=7)
-        content.grid_columnconfigure(1, weight=6)
-        content.grid_rowconfigure(0, weight=1)
+        self.find_bar = QFrame()
+        self.find_bar.setObjectName("FindBar")
+        self.find_bar.hide()
+        find_layout = QHBoxLayout(self.find_bar)
+        find_layout.setContentsMargins(14, 10, 14, 10)
+        find_layout.setSpacing(10)
+        self.find_entry = QLineEdit()
+        self.find_entry.setPlaceholderText("Find in output")
+        self.find_entry.textChanged.connect(self._refresh_find_matches)
+        self.find_entry.returnPressed.connect(self.find_next_match)
+        self.find_status = QLabel("Type to search")
+        self.find_status.setObjectName("FindStatus")
+        self.find_prev_btn = QPushButton("Prev")
+        self.find_prev_btn.setProperty("variant", "ghost")
+        self.find_prev_btn.clicked.connect(self.find_previous_match)
+        self.find_next_btn = QPushButton("Next")
+        self.find_next_btn.setProperty("variant", "ghost")
+        self.find_next_btn.clicked.connect(self.find_next_match)
+        self.find_close_btn = QPushButton("Close")
+        self.find_close_btn.setProperty("variant", "ghost")
+        self.find_close_btn.clicked.connect(self.hide_find_bar)
+        for btn in (self.find_prev_btn, self.find_next_btn, self.find_close_btn):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        find_layout.addWidget(self.find_entry, 1)
+        find_layout.addWidget(self.find_status)
+        find_layout.addWidget(self.find_prev_btn)
+        find_layout.addWidget(self.find_next_btn)
+        find_layout.addWidget(self.find_close_btn)
+        output_layout.addWidget(self.find_bar)
 
-        left_col = ttk.Frame(content, style="App.TFrame")
-        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        left_col.grid_columnconfigure(0, weight=1)
-        left_col.grid_rowconfigure(0, weight=1)
+        self.output_editor = OutputEditor()
+        self.output_editor.setFont(_font_stack(11, monospace=True, weight=QFont.Weight.Medium))
+        self.output_editor.setLineWrapMode(OutputEditor.LineWrapMode.WidgetWidth)
+        output_layout.addWidget(self.output_editor, 1)
 
-        right_col = ttk.Frame(content, style="App.TFrame")
-        right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        right_col.grid_columnconfigure(0, weight=1)
-        right_col.grid_rowconfigure(1, weight=1)
-
-        self.command_panel = ttk.Frame(left_col, style="Card.TFrame", padding=14)
-        self.command_panel.grid(row=0, column=0, sticky="nsew")
-        self.command_panel.grid_columnconfigure(0, weight=1)
-        self.command_panel.grid_rowconfigure(2, weight=1)
-
-        ttk.Label(self.command_panel, text="Command Deck", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            self.command_panel,
-            text="Multiline paste is preserved. Ctrl+Enter executes the current deck.",
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 12))
-
-        self.input_wrap = NumberedText(
-            self.command_panel,
-            height=16,
-            font=mono,
-            wrap="word",
-            undo=True,
-        )
-        self.input_wrap.grid(row=2, column=0, sticky="nsew")
-        self.input_box = self.input_wrap.text
-        self.input_box.bind("<Control-Return>", self._on_ctrl_enter)
-        attach_context_menu(self.input_box)
-
-        self.preflight_row = tk.Frame(self.command_panel, bd=0)
-        self.preflight_row.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-
-        self.actionbar = ttk.Frame(left_col, style="CardAlt.TFrame", padding=(14, 12))
-        self.actionbar.grid(row=1, column=0, sticky="ew", pady=(16, 0))
-        self.actionbar.grid_columnconfigure(1, weight=1)
-
-        buttons = ttk.Frame(self.actionbar, style="CardAlt.TFrame")
-        buttons.grid(row=0, column=0, sticky="w")
-
-        self.execute_btn = ttk.Button(buttons, text="Execute", command=self.on_execute, style="Accent.TButton")
-        self.execute_btn.pack(side="left")
-
-        self.clear_output_btn = ttk.Button(
-            buttons,
-            text="Clear output",
-            command=self.on_clear_output,
-            style="Secondary.TButton",
-        )
-        self.clear_output_btn.pack(side="left", padx=(8, 0))
-
-        self.clear_all_btn = ttk.Button(
-            buttons,
-            text="Clear all",
-            command=self.on_clear_all,
-            style="Ghost.TButton",
-        )
-        self.clear_all_btn.pack(side="left", padx=(8, 0))
-
-        ttk.Label(self.actionbar, textvariable=self.action_meta_var, style="MutedAlt.TLabel").grid(
-            row=0, column=1, sticky="e"
-        )
-
-        self.summary_panel = ttk.Frame(right_col, style="Card.TFrame", padding=14)
-        self.summary_panel.grid(row=0, column=0, sticky="ew")
-        self.summary_panel.grid_columnconfigure(0, weight=1)
-
-        ttk.Label(self.summary_panel, text="Execution Summary", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-
-        metrics = ttk.Frame(self.summary_panel, style="Card.TFrame")
-        metrics.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        for column in range(2):
-            metrics.grid_columnconfigure(column, weight=1)
-
-        self.metric_cards: list[tuple[ttk.Frame, tk.Label, tk.Label]] = []
-        metric_specs = [
-            ("Status", self.status_var),
-            ("Target", self.target_var),
-            ("Method", tk.StringVar(value="GET")),
-            ("Last result", self.result_var),
-        ]
-        self.method_var = metric_specs[2][1]
-
-        for index, (label_text, value_var) in enumerate(metric_specs):
-            row = index // 2
-            column = index % 2
-            card = ttk.Frame(metrics, style="Metric.TFrame", padding=12)
-            card.grid(row=row, column=column, sticky="nsew", padx=(0 if column == 0 else 6, 0 if column == 1 else 6), pady=(0 if row == 0 else 12, 0))
-            title = tk.Label(card, text=label_text, anchor="w", font=("Segoe UI", 9), bd=0)
-            title.pack(anchor="w")
-            value = tk.Label(card, textvariable=value_var, anchor="w", justify="left", font=("Segoe UI Semibold", 14), bd=0)
-            value.pack(anchor="w", pady=(6, 0))
-            self.metric_cards.append((card, title, value))
-
-        ttk.Label(self.summary_panel, textvariable=self.summary_note_var, style="Muted.TLabel").grid(
-            row=2, column=0, sticky="w", pady=(12, 0)
-        )
-
-        self.output_panel = ttk.Frame(right_col, style="Card.TFrame", padding=14)
-        self.output_panel.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
-        self.output_panel.grid_columnconfigure(0, weight=1)
-        self.output_panel.grid_rowconfigure(2, weight=1)
-
-        toolbar = ttk.Frame(self.output_panel, style="CardAlt.TFrame", padding=(12, 10))
-        toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.grid_columnconfigure(0, weight=1)
-
-        ttk.Label(toolbar, textvariable=self.stream_title_var, style="SectionAlt.TLabel").grid(row=0, column=0, sticky="w")
-
-        toolbar_buttons = ttk.Frame(toolbar, style="CardAlt.TFrame")
-        toolbar_buttons.grid(row=0, column=1, sticky="e")
-
-        self.find_btn = ttk.Button(toolbar_buttons, text="Find", command=self.toggle_find_bar, style="Ghost.TButton")
-        self.find_btn.pack(side="left")
-
-        self.jump_btn = ttk.Button(toolbar_buttons, text="Jump to end", command=self.jump_to_end, style="Ghost.TButton")
-        self.jump_btn.pack(side="left", padx=(8, 0))
-
-        self.auto_scroll_btn = ttk.Button(
-            toolbar_buttons,
-            text="Auto-scroll: on",
-            command=self.toggle_auto_scroll,
-            style="Ghost.TButton",
-        )
-        self.auto_scroll_btn.pack(side="left", padx=(8, 0))
-
-        self.copy_btn = ttk.Button(toolbar_buttons, text="Copy output", command=self.copy_output, style="Ghost.TButton")
-        self.copy_btn.pack(side="left", padx=(8, 0))
-
-        self.find_bar = ttk.Frame(self.output_panel, style="CardAlt.TFrame", padding=(12, 10))
-        self.find_bar.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        self.find_bar.grid_columnconfigure(1, weight=1)
-
-        ttk.Label(self.find_bar, text="Find in output", style="MutedAlt.TLabel").grid(row=0, column=0, sticky="w")
-        self.find_entry = tk.Entry(self.find_bar, textvariable=self.find_query_var, relief="flat", bd=0, font=("Segoe UI", 10))
-        self.find_entry.grid(row=0, column=1, sticky="ew", padx=(12, 10))
-        self.find_prev_btn = ttk.Button(self.find_bar, text="Prev", command=self.find_previous_match, style="Ghost.TButton")
-        self.find_prev_btn.grid(row=0, column=2, padx=(0, 8))
-        self.find_next_btn = ttk.Button(self.find_bar, text="Next", command=self.find_next_match, style="Ghost.TButton")
-        self.find_next_btn.grid(row=0, column=3)
-        self.find_close_btn = ttk.Button(self.find_bar, text="Close", command=self.hide_find_bar, style="Ghost.TButton")
-        self.find_close_btn.grid(row=0, column=4, padx=(8, 0))
-        self.find_bar.grid_remove()
-
-        self.output_wrap = NumberedText(
-            self.output_panel,
-            readonly=True,
-            font=mono,
-            wrap="word",
-            state="disabled",
-        )
-        self.output_wrap.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
-        self.output_box = self.output_wrap.text
-        attach_context_menu(self.output_box)
-
-        self._bind_drag_handle(self.header)
-        self._bind_drag_handle(brand)
-        self._bind_drag_handle(title_block)
-        self._bind_drag_handle(self.logo)
-        self._bind_drag_handle(self.status_badge)
-
-        self.minimize_btn.bind("<Button-1>", lambda _event: self.minimize_window())
-        self.close_btn.bind("<Button-1>", lambda _event: self.request_close())
-
-        self.root.bind("<Escape>", self._on_escape, add="+")
-        self.root.bind("<Alt-F4>", lambda _event: (self.request_close(), "break")[1], add="+")
-        self.root.bind("<Map>", self._on_window_map, add="+")
-        self.root.bind("<Configure>", self._on_root_configure, add="+")
-        self.find_entry.bind("<Return>", lambda _event: self.find_next_match())
-        self.find_entry.bind("<Escape>", lambda _event: self.hide_find_bar())
-        self.output_box.tag_configure("find_match", background="#f5d77e", foreground="#10161a")
-        self.output_box.tag_configure("find_current", background="#3db497", foreground="#071512")
-
-        for sequence in ("<KeyRelease>", "<<Paste>>", "<<Cut>>", "<<Undo>>", "<<Redo>>"):
-            self.input_box.bind(sequence, self._schedule_refresh, add="+")
-
-    def _load_preferences_data(self) -> dict[str, object]:
-        return load_preferences_data()
-
-    def _load_geometry_preference(self) -> str:
-        return resolve_geometry_preference(self.prefs, DEFAULT_GEOMETRY)
-
-    def _save_preferences(self) -> None:
-        save_preferences_data(
-            {
-                "theme": self.current_theme,
-                "geometry": self._last_normal_geometry,
-            }
-        )
-
-    def _install_window_icon(self) -> None:
-        self._icon_images = [self._make_icon_image(size) for size in (16, 32, 64)]
-        self.root.iconphoto(True, *self._icon_images)
-
-    def _make_icon_image(self, size: int) -> tk.PhotoImage:
-        image = tk.PhotoImage(width=size, height=size)
-        dark = "#0f1418"
-        accent = "#3db497"
-        accent_alt = "#5f9eff"
-        light = "#eff3f6"
-        border = max(1, size // 16)
-        inset = max(2, size // 6)
-        stroke = max(2, size // 8)
-
-        image.put(dark, to=(0, 0, size, size))
-        image.put(accent_alt, to=(border, border, size - border, size - border))
-        image.put(accent, to=(border * 2, border * 2, size - border * 2, size - border * 2))
-        image.put(dark, to=(inset, inset, size - inset, size - inset))
-        image.put(light, to=(inset, inset, size - inset, inset + stroke))
-        image.put(light, to=(inset, size - inset - stroke, size - inset, size - inset))
-        image.put(light, to=(inset, inset, inset + stroke, size - inset))
-        return image
-
-    def _configure_window_chrome(self) -> None:
-        self.root.protocol("WM_DELETE_WINDOW", self.request_close)
-        self._create_resize_handles()
-
-    def _finalize_window_setup(self) -> None:
-        self._set_borderless(True)
-        self._apply_rounded_corners(self.root, _WINDOW_CORNER_RADIUS)
-        self._suspend_geometry_save = False
-        self._save_preferences()
+    def _create_card(self, role: str) -> QFrame:
+        card = QFrame()
+        card.setProperty("cardRole", role)
+        return card
 
     def _load_theme_preference(self) -> str:
-        return resolve_theme_preference(self.prefs, _THEMES, DEFAULT_THEME)
+        stored = self.settings.value("ui/theme", DEFAULT_THEME)
+        return stored if stored in _THEMES else DEFAULT_THEME
 
-    def _save_theme_preference(self) -> None:
-        self._save_preferences()
+    def _load_bool(self, key: str, default: bool) -> bool:
+        value = self.settings.value(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
-    def _bind_drag_handle(self, widget: tk.Widget) -> None:
-        widget.bind("<ButtonPress-1>", self._start_move, add="+")
-        widget.bind("<B1-Motion>", self._drag_window, add="+")
-        widget.bind("<ButtonRelease-1>", self._end_move, add="+")
+    def _restore_window(self) -> None:
+        geometry = self.settings.value("window/geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        else:
+            self.resize(_DEFAULT_WINDOW_SIZE)
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                self.move(
+                    available.x() + (available.width() - self.width()) // 2,
+                    available.y() + (available.height() - self.height()) // 2,
+                )
 
-    def _start_move(self, event: tk.Event) -> None:
-        self._drag_origin = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
+    def _save_window_state(self) -> None:
+        if not self.isMinimized():
+            self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("ui/theme", self.current_theme)
+        self.settings.setValue("output/autoScroll", self.auto_scroll)
+        self.settings.sync()
+        self._save_session()
 
-    def _drag_window(self, event: tk.Event) -> None:
-        if self._drag_origin is None:
-            return
-        offset_x, offset_y = self._drag_origin
-        self.root.geometry(f"+{event.x_root - offset_x}+{event.y_root - offset_y}")
-
-    def _end_move(self, _event: tk.Event) -> None:
-        self._drag_origin = None
-
-    def _create_resize_handles(self) -> None:
-        specs = [
-            ("n", "sb_v_double_arrow", {"relx": 0, "rely": 0, "relwidth": 1, "height": _RESIZE_BORDER, "x": 14, "width": -28}),
-            ("s", "sb_v_double_arrow", {"relx": 0, "rely": 1, "anchor": "sw", "relwidth": 1, "height": _RESIZE_BORDER, "x": 14, "width": -28}),
-            ("w", "sb_h_double_arrow", {"relx": 0, "rely": 0, "relheight": 1, "width": _RESIZE_BORDER, "y": 14, "height": -28}),
-            ("e", "sb_h_double_arrow", {"relx": 1, "rely": 0, "anchor": "ne", "relheight": 1, "width": _RESIZE_BORDER, "y": 14, "height": -28}),
-            ("nw", "size_nw_se", {"x": 0, "y": 0, "width": _RESIZE_BORDER + 4, "height": _RESIZE_BORDER + 4}),
-            ("ne", "size_ne_sw", {"relx": 1, "x": -(_RESIZE_BORDER + 4), "y": 0, "width": _RESIZE_BORDER + 4, "height": _RESIZE_BORDER + 4}),
-            ("sw", "size_ne_sw", {"x": 0, "rely": 1, "y": -(_RESIZE_BORDER + 4), "width": _RESIZE_BORDER + 4, "height": _RESIZE_BORDER + 4}),
-            ("se", "size_nw_se", {"relx": 1, "rely": 1, "x": -(_RESIZE_BORDER + 4), "y": -(_RESIZE_BORDER + 4), "width": _RESIZE_BORDER + 4, "height": _RESIZE_BORDER + 4}),
-        ]
-        for direction, cursor, placement in specs:
-            handle = tk.Frame(self.root, bd=0, highlightthickness=0, cursor=cursor)
-            handle.place(in_=self.root, **placement)
-            handle.bind("<ButtonPress-1>", lambda event, d=direction: self._start_resize(event, d), add="+")
-            handle.bind("<B1-Motion>", self._perform_resize, add="+")
-            handle.bind("<ButtonRelease-1>", self._end_resize, add="+")
-            self._resize_handles.append(handle)
-
-    def _start_resize(self, event: tk.Event, direction: str) -> None:
-        self._resize_origin = {
-            "direction": direction,
-            "x_root": event.x_root,
-            "y_root": event.y_root,
-            "width": self.root.winfo_width(),
-            "height": self.root.winfo_height(),
-            "x": self.root.winfo_x(),
-            "y": self.root.winfo_y(),
-        }
-
-    def _perform_resize(self, event: tk.Event) -> None:
-        if self._resize_origin is None:
-            return
-
-        direction = str(self._resize_origin["direction"])
-        dx = event.x_root - int(self._resize_origin["x_root"])
-        dy = event.y_root - int(self._resize_origin["y_root"])
-        width = int(self._resize_origin["width"])
-        height = int(self._resize_origin["height"])
-        pos_x = int(self._resize_origin["x"])
-        pos_y = int(self._resize_origin["y"])
-        min_width, min_height = _MIN_WINDOW_SIZE
-
-        if "e" in direction:
-            width = max(min_width, width + dx)
-        if "s" in direction:
-            height = max(min_height, height + dy)
-        if "w" in direction:
-            width = max(min_width, width - dx)
-            pos_x = int(self._resize_origin["x"]) + (int(self._resize_origin["width"]) - width)
-        if "n" in direction:
-            height = max(min_height, height - dy)
-            pos_y = int(self._resize_origin["y"]) + (int(self._resize_origin["height"]) - height)
-
-        self.root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
-
-    def _end_resize(self, _event: tk.Event) -> None:
-        self._resize_origin = None
-
-    def _set_borderless(self, enabled: bool) -> None:
-        self._borderless_enabled = enabled
-        self.root.overrideredirect(enabled)
-        if _IS_WINDOWS:
-            self.root.update_idletasks()
-            self._refresh_taskbar_window_style()
-
-    def _refresh_taskbar_window_style(self) -> None:
-        if not _IS_WINDOWS:
-            return
-        self._window_handle = _USER32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-        style = _USER32.GetWindowLongW(self._window_handle, _GWL_EXSTYLE)
-        style = (style & ~_WS_EX_TOOLWINDOW) | _WS_EX_APPWINDOW
-        _USER32.SetWindowLongW(self._window_handle, _GWL_EXSTYLE, style)
-        _USER32.SetWindowPos(
-            self._window_handle,
-            0,
-            0,
-            0,
-            0,
-            0,
-            _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_FRAMECHANGED,
-        )
-
-    def _on_window_map(self, _event: tk.Event) -> None:
-        if self._restore_borderless_after_map and self.root.state() == "normal":
-            self._restore_borderless_after_map = False
-            self.root.after(20, lambda: self._set_borderless(True))
-
-    def _on_root_configure(self, event: tk.Event) -> None:
-        if event.widget is not self.root:
-            return
-
-        self._apply_rounded_corners(self.root, _WINDOW_CORNER_RADIUS)
-        if self._close_dialog is not None and self._close_dialog.winfo_exists():
-            self._center_dialog(self._close_dialog)
-            self._apply_rounded_corners(self._close_dialog, _DIALOG_CORNER_RADIUS)
-
-        if self._suspend_geometry_save or self.root.state() != "normal":
-            return
-
-        self._last_normal_geometry = (
-            f"{self.root.winfo_width()}x{self.root.winfo_height()}+{self.root.winfo_x()}+{self.root.winfo_y()}"
-        )
-        if self._geometry_job is not None:
-            self.root.after_cancel(self._geometry_job)
-        self._geometry_job = self.root.after(180, self._save_preferences)
-
-    def _apply_rounded_corners(self, window: tk.Toplevel, radius: int) -> None:
-        if not _IS_WINDOWS or not window.winfo_exists():
-            return
-        width = window.winfo_width()
-        height = window.winfo_height()
-        if width <= 1 or height <= 1:
-            return
-        region = _GDI32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius)
-        hwnd = self._window_handle if window is self.root and self._window_handle is not None else window.winfo_id()
-        _USER32.SetWindowRgn(hwnd, region, True)
-
-    def _style_titlebar_buttons(self, colors: dict[str, str]) -> None:
-        self.minimize_btn.configure(bg=colors["titlebar_btn_bg"], fg=colors["titlebar_btn_fg"])
-        self.close_btn.configure(bg=colors["titlebar_btn_bg"], fg=colors["titlebar_btn_fg"])
-        self.find_entry.configure(
-            bg=colors["ghost_bg"],
-            fg=colors["text"],
-            insertbackground=colors["text"],
-            highlightthickness=1,
-            highlightbackground=colors["card_border"],
-            highlightcolor=colors["focus"],
-        )
-
-        self.minimize_btn.bind(
-            "<Enter>",
-            lambda _event: self.minimize_btn.configure(bg=colors["titlebar_btn_hover"]),
-        )
-        self.minimize_btn.bind(
-            "<Leave>",
-            lambda _event: self.minimize_btn.configure(bg=colors["titlebar_btn_bg"]),
-        )
-        self.close_btn.bind(
-            "<Enter>",
-            lambda _event: self.close_btn.configure(bg=colors["titlebar_close_hover"]),
-        )
-        self.close_btn.bind(
-            "<Leave>",
-            lambda _event: self.close_btn.configure(bg=colors["titlebar_btn_bg"]),
-        )
-
-    def minimize_window(self) -> None:
-        self._restore_borderless_after_map = True
-        self._set_borderless(False)
-        self.root.update_idletasks()
-        self.root.iconify()
-
-    def request_close(self) -> None:
-        if self._close_dialog is not None and self._close_dialog.winfo_exists():
-            self._close_dialog.lift()
-            self._close_dialog.focus_force()
-            return
-        self._show_close_dialog()
-
-    def _show_close_dialog(self) -> None:
-        colors = _THEMES[self.current_theme]
-        dialog = tk.Toplevel(self.root)
-        dialog.overrideredirect(True)
-        dialog.transient(self.root)
-        dialog.configure(bg=colors["dialog_scrim"])
-        dialog.attributes("-topmost", True)
-
-        card = tk.Frame(dialog, bg=colors["card_bg"], highlightthickness=1, highlightbackground=colors["card_border"])
-        card.pack(padx=1, pady=1)
-
-        title = tk.Label(
-            card,
-            text="Exit cURLsender?",
-            bg=colors["card_bg"],
-            fg=colors["text"],
-            font=("Segoe UI Semibold", 13),
-            padx=18,
-            pady=16,
-        )
-        title.pack(anchor="w")
-
-        body = tk.Label(
-            card,
-            text="The current command and theme preference are already cached locally. Do you want to close the app now?",
-            bg=colors["card_bg"],
-            fg=colors["muted"],
-            justify="left",
-            wraplength=320,
-            font=("Segoe UI", 10),
-            padx=18,
-            pady=0,
-        )
-        body.pack(anchor="w")
-
-        button_row = tk.Frame(card, bg=colors["card_bg"], padx=18, pady=18)
-        button_row.pack(fill="x")
-
-        cancel_btn = ttk.Button(button_row, text="Stay here", command=self._dismiss_close_dialog, style="Ghost.TButton")
-        cancel_btn.pack(side="right")
-        exit_btn = ttk.Button(button_row, text="Exit now", command=self._confirm_close, style="Accent.TButton")
-        exit_btn.pack(side="right", padx=(0, 8))
-
-        dialog.bind("<Escape>", lambda _event: self._dismiss_close_dialog())
-        dialog.bind("<Return>", lambda _event: self._confirm_close())
-
-        self._close_dialog = dialog
-        self._center_dialog(dialog)
-        self._apply_rounded_corners(dialog, _DIALOG_CORNER_RADIUS)
-        dialog.grab_set()
-        dialog.focus_force()
-
-    def _center_dialog(self, dialog: tk.Toplevel) -> None:
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        pos_x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
-        pos_y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
-        dialog.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
-
-    def _dismiss_close_dialog(self) -> None:
-        if self._close_dialog is None or not self._close_dialog.winfo_exists():
-            self._close_dialog = None
-            return
-        dialog = self._close_dialog
-        self._close_dialog = None
-        dialog.grab_release()
-        dialog.destroy()
-        self.root.focus_force()
-
-    def _confirm_close(self) -> None:
-        self._save_preferences()
-        self._dismiss_close_dialog()
-        self.root.destroy()
-
-    def _apply_theme(self, theme_name: str) -> None:
-        colors = _THEMES[theme_name]
-        self.current_theme = theme_name
-
-        self.root.configure(bg=colors["window_bg"])
-
-        self.style.configure("Shell.TFrame", background=colors["shell_bg"])
-        self.style.configure(
-            "App.TFrame",
-            background=colors["card_bg"],
-            borderwidth=1,
-            relief="solid",
-            bordercolor=colors["shell_border"],
-        )
-        self.style.configure(
-            "Card.TFrame",
-            background=colors["card_bg"],
-            borderwidth=1,
-            relief="solid",
-            bordercolor=colors["card_border"],
-        )
-        self.style.configure(
-            "CardAlt.TFrame",
-            background=colors["card_alt_bg"],
-            borderwidth=1,
-            relief="solid",
-            bordercolor=colors["card_border"],
-        )
-        self.style.configure(
-            "Metric.TFrame",
-            background=colors["metric_bg"],
-            borderwidth=1,
-            relief="solid",
-            bordercolor=colors["card_border"],
-        )
-        self.style.configure("EditorShell.TFrame", background=colors["editor_bg"])
-
-        self.style.configure("Brand.TLabel", background=colors["card_bg"], foreground=colors["text"], font=("Segoe UI Semibold", 13))
-        self.style.configure("Section.TLabel", background=colors["card_bg"], foreground=colors["muted"], font=("Segoe UI Semibold", 10))
-        self.style.configure("SectionAlt.TLabel", background=colors["card_alt_bg"], foreground=colors["muted"], font=("Segoe UI Semibold", 10))
-        self.style.configure("Muted.TLabel", background=colors["card_bg"], foreground=colors["muted"], font=("Segoe UI", 9))
-        self.style.configure("MutedAlt.TLabel", background=colors["card_alt_bg"], foreground=colors["muted"], font=("Segoe UI", 9))
-
-        self.style.configure(
-            "Accent.TButton",
-            background=colors["accent"],
-            foreground=colors["accent_text"],
-            borderwidth=0,
-            focusthickness=3,
-            focuscolor=colors["focus"],
-            padding=(14, 10),
-            font=("Segoe UI Semibold", 10),
-        )
-        self.style.map(
-            "Accent.TButton",
-            background=[("active", colors["accent_hover"]), ("pressed", colors["accent_hover"])],
-            foreground=[("disabled", colors["muted"])],
-        )
-        self.style.configure(
-            "Secondary.TButton",
-            background=colors["secondary_bg"],
-            foreground=colors["secondary_text"],
-            borderwidth=0,
-            focusthickness=3,
-            focuscolor=colors["focus"],
-            padding=(14, 10),
-            font=("Segoe UI Semibold", 10),
-        )
-        self.style.map(
-            "Secondary.TButton",
-            background=[("active", colors["secondary_hover"]), ("pressed", colors["secondary_hover"])],
-            foreground=[("disabled", colors["muted"])],
-        )
-        self.style.configure(
-            "Ghost.TButton",
-            background=colors["ghost_bg"],
-            foreground=colors["ghost_text"],
-            borderwidth=0,
-            focusthickness=3,
-            focuscolor=colors["focus"],
-            padding=(12, 10),
-            font=("Segoe UI Semibold", 10),
-        )
-        self.style.map(
-            "Ghost.TButton",
-            background=[("active", colors["ghost_hover"]), ("pressed", colors["ghost_hover"])],
-            foreground=[("disabled", colors["muted"])],
-        )
-        self.style.configure(
-            "Signal.Vertical.TScrollbar",
-            background=colors["ghost_bg"],
-            darkcolor=colors["ghost_bg"],
-            lightcolor=colors["ghost_bg"],
-            troughcolor=colors["card_bg"],
-            bordercolor=colors["card_border"],
-            arrowcolor=colors["muted"],
-            gripcount=0,
-        )
-
-        for text_widget in (self.input_wrap, self.output_wrap):
-            text_widget.apply_theme(colors)
-
-        self.logo.configure(bg=colors["accent"], fg=colors["accent_text"])
-        self.preflight_row.configure(bg=colors["card_bg"])
-        self.status_badge.configure(bg=colors["badge_bg"], fg=colors["badge_fg"])
-        for handle in self._resize_handles:
-            handle.configure(bg=colors["window_bg"])
-
-        for card, title, value in self.metric_cards:
-            title.configure(bg=colors["metric_bg"], fg=colors["muted"])
-            value.configure(bg=colors["metric_bg"], fg=colors["text"])
-
-        self._style_titlebar_buttons(colors)
-        self.output_box.tag_configure("find_match", background=colors["warn_fg"], foreground=colors["output_bg"])
-        self.output_box.tag_configure("find_current", background=colors["accent"], foreground=colors["accent_text"])
-        self.theme_btn.configure(text=f"Theme: {'Light' if theme_name == 'dark' else 'Dark'}")
-        self._sync_badge_colors()
-        self._render_preflight()
-        self._apply_rounded_corners(self.root, _WINDOW_CORNER_RADIUS)
-
-    def toggle_theme(self) -> None:
-        next_theme = "light" if self.current_theme == "dark" else "dark"
-        self._apply_theme(next_theme)
-        self._save_theme_preference()
-
-    def _load_last(self) -> None:
+    def _load_last_command(self) -> None:
         cached = read_cached_command()
         if cached:
             self.command_restored = True
-            self.input_box.insert("1.0", cached)
-            self.input_box.edit_reset()
-            self.action_meta_var.set("Last command restored from local cache.")
+            self.command_editor.blockSignals(True)
+            self.command_editor.setPlainText(cached)
+            self.command_editor.blockSignals(False)
+            self.action_meta.setText("Last command restored from local cache.")
+        else:
+            default_cmd = (
+                'curl -X GET "https://jsonplaceholder.typicode.com/posts/1" \\\n'
+                '  -H "User-Agent: cURLsender/2.0" \\\n'
+                '  -H "Accept: application/json" \\\n'
+                '  -H "X-Custom-Header: Demo-Request" \\\n'
+                '  --verbose \\\n'
+                '  --connect-timeout 10 \\\n'
+                '  --max-time 30 \\\n'
+                '  --location \\\n'
+                '  --compressed'
+            )
+            self.command_editor.blockSignals(True)
+            self.command_editor.setPlainText(default_cmd)
+            self.command_editor.blockSignals(False)
+            self.action_meta.setText("Default demo command loaded. Edit and execute or paste your own.")
+        self._clear_editor_selections()
 
-    def _save_last(self, raw: str) -> None:
-        write_cached_command(raw)
+    def _save_session(self) -> None:
+        save_session_data({
+            "command": self.command_editor.toPlainText(),
+            "output": self.output_editor.toPlainText() if self.run_state != "idle" else "",
+            "auto_scroll": self.auto_scroll,
+            "last_exit_code": self.last_exit_code,
+        })
 
-    def _schedule_refresh(self, _event: tk.Event | None = None) -> None:
-        self.root.after_idle(self._refresh_command_analysis)
+    def _clear_editor_selections(self) -> None:
+        self.command_editor.setExtraSelections([])
+        cursor = self.command_editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        self.command_editor.setTextCursor(cursor)
+
+    def _restore_session(self) -> None:
+        session = load_session_data()
+        output = session.get("output", "") if session else ""
+        if output and isinstance(output, str):
+            self.output_editor.blockSignals(True)
+            self.output_editor.setPlainText(output)
+            self.output_editor.blockSignals(False)
+
+    def _build_stylesheet(self) -> str:
+        c = self.colors
+        r = 0 if self.isMaximized() else _WINDOW_RADIUS
+        return f"""
+        QWidget {{ color: {c['text']}; font: 10pt "Segoe UI"; }}
+        QWidget#Surface {{ background: {c['shell_bg']}; border: 1px solid {c['shell_border']}; border-radius: {r}px; }}
+        QFrame[cardRole="default"] {{ background: {c['card_bg']}; border: 1px solid {c['card_border']}; border-radius: {_CARD_RADIUS}px; }}
+        QFrame[cardRole="alt"] {{ background: {c['card_alt_bg']}; border: 1px solid {c['card_border']}; border-radius: {_CARD_RADIUS}px; }}
+        QFrame[cardRole="metric"] {{ background: {c['metric_bg']}; border: 1px solid transparent; border-radius: 20px; }}
+        QFrame[cardRole="metric"][variant="good"] {{ border-color: {c['good_fg']}; }}
+        QFrame[cardRole="metric"][variant="warn"] {{ border-color: {c['warn_fg']}; }}
+        QFrame[cardRole="metric"][variant="bad"] {{ border-color: {c['bad_fg']}; }}
+        QWidget#TitleBar {{ background: {c['card_bg']}; border: 1px solid {c['card_border']}; border-radius: {_CARD_RADIUS}px; }}
+        QLabel#BrandTitle {{ color: {c['text']}; font: 700 18pt "Segoe UI"; }}
+        QLabel#BrandSubtitle, QLabel#PreflightNote, QLabel#ActionMeta, QLabel#FindStatus, QLabel#MetricTitle {{ color: {c['muted']}; }}
+        QLabel#SectionTitle {{ color: {c['text']}; letter-spacing: 0.08em; }}
+        QLabel#MetricValue {{ color: {c['text']}; }}
+        QLabel#StatusBadge {{ background: {c['badge_bg']}; color: {c['badge_fg']}; border: 1px solid transparent; border-radius: 12px; padding: 5px 14px; font: 600 10pt "Segoe UI"; }}
+        QLabel#PreflightChip {{ border-radius: 14px; padding: 7px 11px; font: 600 9pt "Segoe UI"; }}
+        QLabel#PreflightChip[tone="accent"] {{ background: {c['chip_bg']}; color: {c['chip_fg']}; }}
+        QLabel#PreflightChip[tone="warn"] {{ background: {c['warn_bg']}; color: {c['warn_fg']}; }}
+        QLabel#PreflightChip[tone="ghost"] {{ background: {c['ghost_bg']}; color: {c['muted']}; }}
+        QPushButton {{ border: 1px solid transparent; border-radius: 16px; padding: 9px 16px; font: 600 10pt "Segoe UI"; }}
+        QPushButton[variant="primary"] {{ background: {c['accent']}; color: {c['accent_text']}; }}
+        QPushButton[variant="primary"]:hover {{ background: {c['accent_hover']}; }}
+        QPushButton[variant="secondary"] {{ background: {c['secondary_bg']}; color: {c['secondary_text']}; }}
+        QPushButton[variant="secondary"]:hover {{ background: {c['secondary_hover']}; }}
+        QPushButton[variant="ghost"] {{ background: {c['ghost_bg']}; color: {c['ghost_text']}; }}
+        QPushButton[variant="ghost"]:hover {{ background: {c['ghost_hover']}; }}
+        QPushButton[toolbarRole="true"] {{ padding: 6px 12px; font: 600 9pt "Segoe UI"; border-radius: 12px; }}
+        QPushButton[titleRole] {{ min-width: 34px; max-width: 34px; min-height: 34px; max-height: 34px; border-radius: 12px; background: {c['titlebar_btn_bg']}; color: {c['titlebar_btn_fg']}; font: 700 13pt "Segoe UI"; padding: 0; }}
+        QPushButton[titleRole]:hover {{ background: {c['titlebar_btn_hover']}; }}
+        QPushButton[titleRole="close"]:hover {{ background: {c['titlebar_close_hover']}; }}
+        QLineEdit {{ background: {c['editor_bg']}; color: {c['editor_fg']}; border: 1px solid {c['card_border']}; border-radius: 12px; padding: 10px 12px; selection-background-color: {c['select_bg']}; selection-color: {c['select_fg']}; }}
+        QFrame#FindBar {{ background: {c['card_alt_bg']}; border: 1px solid {c['card_border']}; border-radius: 16px; }}
+        QScrollBar:vertical {{ background: transparent; width: 12px; margin: 8px 0 8px 0; }}
+        QScrollBar::handle:vertical {{ background: {c['ghost_bg']}; min-height: 34px; border-radius: 6px; }}
+        QScrollBar::handle:vertical:hover {{ background: {c['secondary_bg']}; }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical, QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; height: 0px; }}
+        """
+
+    def _apply_theme(self, theme_name: str, *, persist: bool = True) -> None:
+        self.current_theme = theme_name if theme_name in _THEMES else DEFAULT_THEME
+        self.colors = _THEMES[self.current_theme]
+        self.setStyleSheet(self._build_stylesheet())
+        self.logo.apply_theme(self.colors)
+        self.command_editor.apply_theme(self.colors)
+        self.output_editor.apply_theme(self.colors)
+        self.theme_btn.setText(f"Theme: {'Light' if self.current_theme == 'dark' else 'Dark'}")
+        self._update_status_badge()
+        self._render_preflight()
+        self._sync_ui_state(force_defaults=True)
+        self._refresh_find_matches()
+        if self._shadow_effect is not None:
+            self._shadow_effect.setColor(QColor(self.colors["shadow"]))
+        if persist:
+            self.settings.setValue("ui/theme", self.current_theme)
+
+    def toggle_theme(self) -> None:
+        self._apply_theme("light" if self.current_theme == "dark" else "dark")
 
     def _refresh_command_analysis(self) -> None:
-        self.command_analysis = analyze_command(self.input_box.get("1.0", "end-1c"))
-        self.method_var.set(str(self.command_analysis["method"]))
-        self.target_var.set(str(self.command_analysis["host"]))
-        self.summary_note_var.set(str(self.command_analysis["detail_text"]))
+        self.command_analysis = analyze_command(self.command_editor.toPlainText())
+        self.preflight_note.setText(str(self.command_analysis["detail_text"]))
         self._render_preflight()
         self._sync_ui_state(force_defaults=True)
 
     def _render_preflight(self) -> None:
-        colors = _THEMES[self.current_theme]
-        for child in self.preflight_row.winfo_children():
-            child.destroy()
+        while self.preflight_layout.count():
+            item = self.preflight_layout.takeAt(0)
+            if item and (w := item.widget()):
+                w.deleteLater()
 
-        chip_texts = list(self.command_analysis["chip_texts"])  # type: ignore[arg-type]
+        chip_texts = list(self.command_analysis["chip_texts"])
+        if self.command_analysis["has_output"] and "Large transfer risk" not in chip_texts:
+            chip_texts.append("Large transfer risk")
+
+        tone = "accent"
         if not chip_texts:
             chip_texts = ["Awaiting input"]
-            bg = colors["ghost_bg"]
-            fg = colors["muted"]
-        else:
-            bg = colors["chip_bg"]
-            fg = colors["chip_fg"]
-
-        if not self.command_analysis["valid"] and self.command_analysis["has_command"]:
-            line_hint = self.command_analysis["error_line"]
+            tone = "ghost"
+        if self.command_analysis["has_command"] and not self.command_analysis["valid"]:
             chip_texts = ["Quote check needed"]
-            if line_hint is not None:
+            if (line_hint := self.command_analysis["error_line"]) is not None:
                 chip_texts.append(f"line {line_hint}")
-            bg = colors["warn_bg"]
-            fg = colors["warn_fg"]
+            tone = "warn"
 
-        for index, text in enumerate(chip_texts[:5]):
-            chip = tk.Label(
-                self.preflight_row,
-                text=text,
-                bg=bg,
-                fg=fg,
-                padx=10,
-                pady=6,
-                bd=0,
-                font=("Segoe UI Semibold", 9),
-            )
-            chip.grid(row=0, column=index, padx=(0, 8), sticky="w")
+        for text in chip_texts[:6]:
+            label = QLabel(text)
+            label.setObjectName("PreflightChip")
+            label.setProperty("tone", tone)
+            self.preflight_layout.addWidget(label)
 
-    def _sync_badge_colors(self) -> None:
-        colors = _THEMES[self.current_theme]
-        status_text = self.status_var.get().lower()
-        badge_bg = colors["badge_bg"]
-        badge_fg = colors["badge_fg"]
-        value_fg = colors["text"]
+    def _status_badge_text(self) -> str:
+        mapping = {
+            "running": "Streaming", "cancelling": "Cancelling", "cancelled": "Cancelled",
+            "parse error": "Parse error", "error": "Error", "done": "Complete",
+        }
+        if self.run_state in mapping:
+            return mapping[self.run_state]
+        if self.command_analysis["has_command"] and not self.command_analysis["valid"]:
+            return "Warning"
+        return "Ready" if self.command_analysis["valid"] else "Idle"
 
-        if "stream" in status_text or "running" in status_text:
-            badge_bg = colors["good_bg"]
-            badge_fg = colors["good_fg"]
-            value_fg = colors["good_fg"]
-        elif "cancel" in status_text:
-            badge_bg = colors["warn_bg"]
-            badge_fg = colors["warn_fg"]
-            value_fg = colors["warn_fg"]
-        elif "error" in status_text:
-            badge_bg = colors["bad_bg"]
-            badge_fg = colors["bad_fg"]
-            value_fg = colors["bad_fg"]
-        elif "done" in status_text:
-            badge_bg = colors["good_bg"]
-            badge_fg = colors["good_fg"]
-            value_fg = colors["good_fg"]
-
-        self.status_badge.configure(bg=badge_bg, fg=badge_fg, text=self._build_status_badge_text())
-        self.metric_cards[0][2].configure(fg=value_fg, bg=colors["metric_bg"])
-
-    def _build_status_badge_text(self) -> str:
-        analysis = self.command_analysis
-        if self.run_state == "running":
-            return "Live stream | cancel available | curl active"
-        if self.run_state == "cancelling":
-            return "Termination requested | waiting for curl"
-        if self.run_state == "cancelled":
-            return "Stopped early | raw output preserved"
-        if self.run_state == "parse error":
-            return "Parse error | fix quoting before execute"
-        if self.run_state == "error":
-            return "Execution error | inspect the signal stream"
-        if self.run_state == "done":
-            return "Complete | raw output preserved"
-        if analysis["has_command"] and not analysis["valid"]:
-            return "Preflight warning | close the quote before run"
-        if analysis["valid"]:
-            return "Ready | Ctrl+Enter executes | curl detected"
-        return "Idle | paste a curl command to begin"
+    def _update_status_badge(self) -> None:
+        self.status_badge.setText(self._status_badge_text())
+        if self.run_state in {"running", "done"}:
+            bg, fg = self.colors["good_bg"], self.colors["good_fg"]
+        elif self.run_state in {"cancelling", "cancelled", "parse error"}:
+            bg, fg = self.colors["warn_bg"], self.colors["warn_fg"]
+        elif self.run_state == "error":
+            bg, fg = self.colors["bad_bg"], self.colors["bad_fg"]
+        else:
+            bg, fg = self.colors["badge_bg"], self.colors["badge_fg"]
+        self.status_badge.setStyleSheet(
+            f"background:{bg};color:{fg};border-radius:12px;padding:5px 14px;font:600 10pt 'Segoe UI';"
+        )
 
     def _sync_ui_state(self, *, force_defaults: bool = False) -> None:
-        analysis = self.command_analysis
-        restored_note = " Last command restored." if self.command_restored else ""
-
         if self.run_state == "idle" and force_defaults:
-            if analysis["has_command"] and analysis["valid"]:
-                self.status_var.set("Ready")
-                self.action_meta_var.set(f"Ctrl+Enter executes. Local cache stays enabled.{restored_note}")
-            elif analysis["has_command"] and not analysis["valid"]:
-                self.status_var.set("Needs attention")
-                self.action_meta_var.set(
-                    f"Preflight found a quoting issue. Fix it before execute.{restored_note}"
-                )
+            restored = " Last command restored." if self.command_restored else ""
+            if self.command_analysis["has_command"] and self.command_analysis["valid"]:
+                self.action_meta.setText(f"Ctrl+Enter executes. Local cache stays enabled.{restored}")
+            elif self.command_analysis["has_command"]:
+                self.action_meta.setText(f"Preflight found a quoting issue. Fix it before execute.{restored}")
             else:
-                self.status_var.set("Idle")
-                self.action_meta_var.set(f"Paste a curl command to begin.{restored_note}")
+                self.action_meta.setText(f"Paste a curl command to begin.{restored}")
 
-        if self.last_elapsed is None:
-            self.elapsed_var.set("-")
+        state_map = {
+            "running": "Streaming", "cancelling": "Cancelling", "cancelled": "Cancelled",
+            "parse error": "Parse error", "error": "Execution error", "done": "Done",
+        }
+        status_value = state_map.get(self.run_state, "Ready" if (
+            self.command_analysis["valid"] and self.command_analysis["has_command"]
+        ) else "Idle")
 
-        result = "No run yet"
+        elapsed_text = f"{self.last_elapsed:.2f}s" if self.last_elapsed is not None else "-"
+        if self.run_started_at is not None and self.run_state in {"running", "cancelling"}:
+            elapsed_text = f"{time.monotonic() - self.run_started_at:.2f}s"
+
         if self.last_exit_code is not None:
-            elapsed = f" in {self.last_elapsed:.2f}s" if self.last_elapsed is not None else ""
-            result = f"exit {self.last_exit_code}{elapsed}"
+            exit_text = str(self.last_exit_code)
         elif self.run_state == "running":
-            result = "pending"
+            exit_text = "Pending"
         elif self.run_state == "cancelling":
-            result = "awaiting stop"
-        elif self.run_state == "cancelled":
-            result = f"exit {self.last_exit_code}" if self.last_exit_code is not None else "cancelled"
-        self.result_var.set(result)
+            exit_text = "Stopping"
+        elif self.run_state == "parse error":
+            exit_text = "Blocked"
+        else:
+            exit_text = "No run yet"
 
-        self.stream_title_var.set(f"Signal Stream | elapsed {self.elapsed_var.get()}")
-        self.auto_scroll_btn.configure(text=f"Auto-scroll: {'on' if self.auto_scroll else 'off'}")
-        self.execute_btn.configure(text="Cancel" if self.run_state in {"running", "cancelling"} else "Execute")
-        self.clear_all_btn.configure(state="disabled" if self.run_state in {"running", "cancelling"} else "normal")
-        self._sync_badge_colors()
+        self.metric_status.set_value(status_value)
+        self.metric_elapsed.set_value(elapsed_text)
+        rate_seconds = self.last_elapsed
+        if self.run_started_at is not None and self.run_state in {"running", "cancelling"}:
+            rate_seconds = max(time.monotonic() - self.run_started_at, 0.01)
+        self.metric_rate.set_value(_format_rate(self._bytes_received, rate_seconds))
+        self.metric_exit.set_value(exit_text)
+        self.output_title.setText("SIGNAL STREAM")
+
+        variant_map = {"running": "good", "done": "good", "cancelling": "warn", "cancelled": "warn",
+                       "parse error": "warn", "error": "bad"}
+        self.metric_status.set_variant(variant_map.get(self.run_state, "neutral"))
+
+        self.execute_btn.setText("Cancel request" if self.run_state in {"running", "cancelling"} else "Execute")
+        busy = self.run_state in {"running", "cancelling"}
+        self.validate_btn.setDisabled(busy)
+        self.clear_all_btn.setDisabled(busy)
+        self.auto_scroll_btn.setText(f"Auto-scroll {'on' if self.auto_scroll else 'off'}")
+        self._update_status_badge()
 
     def _set_run_state(self, state: str, *, action_meta: str | None = None) -> None:
         self.run_state = state
-        if state == "running":
-            self.status_var.set("Streaming")
-        elif state == "cancelling":
-            self.status_var.set("Cancelling")
-        elif state == "cancelled":
-            self.status_var.set("Cancelled")
-        elif state == "parse error":
-            self.status_var.set("Parse error")
-        elif state == "error":
-            self.status_var.set("Execution error")
-        elif state == "done":
-            self.status_var.set("Done")
-        elif state == "idle":
-            self.status_var.set("Idle")
-
         if action_meta is not None:
-            self.action_meta_var.set(action_meta)
+            self.action_meta.setText(action_meta)
         self._sync_ui_state()
 
-    def _on_ctrl_enter(self, _event: tk.Event) -> str:
-        self.on_execute()
-        return "break"
-
-    def _on_escape(self, _event: tk.Event) -> str | None:
-        if self._close_dialog is not None and self._close_dialog.winfo_exists():
-            self._dismiss_close_dialog()
-            return "break"
-        if self._find_bar_visible and self.root.focus_get() == self.find_entry:
-            self.hide_find_bar()
-            return "break"
-        if self.proc is not None and self.proc.poll() is None:
-            self.on_execute()
-            return "break"
-        return None
-
-    def _append(self, text: str) -> None:
-        self.output_box.configure(state="normal")
-        self.output_box.insert("end", text)
+    def _append_output(self, text: str) -> None:
+        cursor = self.output_editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self.output_editor.setTextCursor(cursor)
         if self.auto_scroll:
-            self.output_box.see("end")
-        self.output_box.configure(state="disabled")
-        if self._find_bar_visible and self.find_query_var.get().strip():
-            self.root.after_idle(self._refresh_find_matches)
+            self.output_editor.moveCursor(QTextCursor.MoveOperation.End)
+            self.output_editor.ensureCursorVisible()
+        if self.find_bar.isVisible() and self.find_entry.text().strip():
+            self._refresh_find_matches()
 
     def _clear_output(self) -> None:
-        self.output_box.configure(state="normal")
-        self.output_box.delete("1.0", "end")
-        self.output_box.configure(state="disabled")
-        self._clear_find_highlights()
-        self._find_matches = []
+        self.output_editor.clear()
+        self._find_positions = []
         self._find_index = -1
+        self.output_editor.set_highlight_selections([])
+        self.find_status.setText("Type to search")
 
     def on_clear_output(self) -> None:
         self._clear_output()
-        self.action_meta_var.set("Signal stream cleared. Command deck preserved.")
+        self.action_meta.setText("Signal stream cleared. Command deck preserved.")
         self._sync_ui_state()
 
     def on_clear_all(self) -> None:
-        self.input_box.delete("1.0", "end")
+        self.command_editor.clear()
         self._clear_output()
         self.run_started_at = None
         self.last_elapsed = None
         self.last_exit_code = None
-        self.run_state = "idle"
+        self._bytes_received = 0
         self.command_restored = False
+        self.run_state = "idle"
         self._refresh_command_analysis()
 
+    def copy_output(self) -> None:
+        QGuiApplication.clipboard().setText(self.output_editor.toPlainText())
+        self.action_meta.setText("Signal stream copied to the clipboard.")
+        self._sync_ui_state()
+
     def jump_to_end(self) -> None:
-        self.output_box.see("end")
-        self.action_meta_var.set("Jumped to the latest signal output.")
+        self.output_editor.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_editor.ensureCursorVisible()
+        self.action_meta.setText("Jumped to the latest signal output.")
         self._sync_ui_state()
 
     def toggle_auto_scroll(self) -> None:
         self.auto_scroll = not self.auto_scroll
         if self.auto_scroll:
-            self.output_box.see("end")
-            self.action_meta_var.set("Auto-scroll enabled for live output.")
+            self.jump_to_end()
         else:
-            self.action_meta_var.set("Auto-scroll paused. Streaming continues.")
-        self._sync_ui_state()
-
-    def copy_output(self) -> None:
-        output = self.output_box.get("1.0", "end-1c")
-        self.root.clipboard_clear()
-        self.root.clipboard_append(output)
-        self.action_meta_var.set("Signal stream copied to the clipboard.")
-        self._sync_ui_state()
+            self.action_meta.setText("Auto-scroll paused. Streaming continues.")
+            self._sync_ui_state()
 
     def toggle_find_bar(self) -> None:
-        if self._find_bar_visible:
-            self.hide_find_bar()
-        else:
-            self.show_find_bar()
+        self.hide_find_bar() if self.find_bar.isVisible() else self.show_find_bar()
 
     def show_find_bar(self) -> None:
-        self._find_bar_visible = True
-        self.find_bar.grid()
-        self.find_entry.focus_set()
-        self.find_entry.selection_range(0, "end")
-        self.action_meta_var.set("Find opened for the signal stream.")
+        self.find_bar.show()
+        self.find_entry.setFocus()
+        self.find_entry.selectAll()
+        self.action_meta.setText("Find opened for the signal stream.")
         self._refresh_find_matches()
 
     def hide_find_bar(self) -> None:
-        self._find_bar_visible = False
-        self.find_bar.grid_remove()
-        self.find_query_var.set("")
-        self._clear_find_highlights()
-        self._find_matches = []
+        self.find_bar.hide()
+        self.find_entry.clear()
+        self._find_positions = []
         self._find_index = -1
-        self.action_meta_var.set("Find closed. Streaming view restored.")
+        self.output_editor.set_highlight_selections([])
+        self.find_status.setText("Type to search")
+        self.action_meta.setText("Find closed. Streaming view restored.")
         self._sync_ui_state()
 
-    def _on_find_query_change(self, *_args) -> None:
-        if self._find_bar_visible:
-            self.root.after_idle(self._refresh_find_matches)
-
-    def _clear_find_highlights(self) -> None:
-        self.output_box.tag_remove("find_match", "1.0", "end")
-        self.output_box.tag_remove("find_current", "1.0", "end")
-
-    def _refresh_find_matches(self) -> None:
-        self._clear_find_highlights()
-        self._find_matches = []
-        self._find_index = -1
-        query = self.find_query_var.get().strip()
+    def _refresh_find_matches(self, *_args) -> None:
+        query = self.find_entry.text()
+        if not self.find_bar.isVisible():
+            return
         if not query:
+            self._find_positions = []
+            self._find_index = -1
+            self.output_editor.set_highlight_selections([])
+            self.find_status.setText("Type to search")
             return
 
-        cursor = "1.0"
-        while True:
-            match_start = self.output_box.search(query, cursor, nocase=True, stopindex="end-1c")
-            if not match_start:
-                break
-            match_end = f"{match_start}+{len(query)}c"
-            self._find_matches.append((match_start, match_end))
-            self.output_box.tag_add("find_match", match_start, match_end)
-            cursor = match_end
+        content = self.output_editor.toPlainText()
+        needle = query.casefold()
+        positions: list[int] = []
+        start = 0
+        while (index := content.casefold().find(needle, start)) >= 0:
+            positions.append(index)
+            start = index + len(query)
 
-        if not self._find_matches:
-            self.action_meta_var.set(f"No matches for '{query}' in the signal stream.")
+        self._find_positions = positions
+        if not positions:
+            self._find_index = -1
+            self.output_editor.set_highlight_selections([])
+            self.find_status.setText("No matches")
+            self.action_meta.setText(f"No matches for '{query}' in the signal stream.")
             return
 
-        self._find_index = 0
-        self._focus_find_match()
+        if self._find_index < 0 or self._find_index >= len(positions):
+            self._find_index = 0
 
-    def _focus_find_match(self) -> None:
-        if not self._find_matches:
-            return
-        self.output_box.tag_remove("find_current", "1.0", "end")
-        start, end = self._find_matches[self._find_index]
-        self.output_box.tag_add("find_current", start, end)
-        self.output_box.see(start)
-        self.action_meta_var.set(
-            f"Find match {self._find_index + 1} of {len(self._find_matches)} in the signal stream."
-        )
+        selections = []
+        for idx, position in enumerate(positions):
+            cursor = self.output_editor.textCursor()
+            cursor.setPosition(position)
+            cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, len(query))
+            sel = QTextEdit.ExtraSelection()
+            if idx == self._find_index:
+                sel.format.setBackground(QColor(self.colors["find_current_bg"]))
+                sel.format.setForeground(QColor(self.colors["find_current_fg"]))
+            else:
+                sel.format.setBackground(QColor(self.colors["find_match_bg"]))
+            sel.cursor = cursor
+            selections.append(sel)
+
+        self.output_editor.set_highlight_selections(selections)
+        cursor = self.output_editor.textCursor()
+        cursor.setPosition(positions[self._find_index])
+        cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, len(query))
+        self.output_editor.setTextCursor(cursor)
+        self.output_editor.ensureCursorVisible()
+        self.find_status.setText(f"{self._find_index + 1}/{len(positions)}")
 
     def find_next_match(self) -> None:
-        if not self._find_bar_visible:
+        if not self.find_bar.isVisible():
             self.show_find_bar()
             return
-        if not self._find_matches:
+        if not self._find_positions:
             self._refresh_find_matches()
             return
-        self._find_index = (self._find_index + 1) % len(self._find_matches)
-        self._focus_find_match()
+        self._find_index = (self._find_index + 1) % len(self._find_positions)
+        self._refresh_find_matches()
 
     def find_previous_match(self) -> None:
-        if not self._find_bar_visible:
+        if not self.find_bar.isVisible():
             self.show_find_bar()
             return
-        if not self._find_matches:
+        if not self._find_positions:
             self._refresh_find_matches()
             return
-        self._find_index = (self._find_index - 1) % len(self._find_matches)
-        self._focus_find_match()
+        self._find_index = (self._find_index - 1) % len(self._find_positions)
+        self._refresh_find_matches()
+
+    def on_validate(self) -> None:
+        self.command_analysis = analyze_command(self.command_editor.toPlainText())
+        if not self.command_analysis["normalized"]:
+            self.run_state = "idle"
+            self.action_meta.setText("Paste a curl command before validating.")
+        elif not self.command_analysis["valid"]:
+            self.run_state = "parse error"
+            self.action_meta.setText(self.command_analysis["detail_text"])
+        else:
+            self.run_state = "idle"
+            self.action_meta.setText("Preflight passed. Execution not started.")
+        self.preflight_note.setText(str(self.command_analysis["detail_text"]))
+        self._render_preflight()
+        self._sync_ui_state(force_defaults=False)
 
     def on_execute(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
+        if self._worker is not None and self.run_state in {"running", "cancelling"}:
             self.cancel_requested = True
             self._set_run_state("cancelling", action_meta="Termination signal sent to curl.")
-            try:
-                self.proc.terminate()
-            except OSError:
-                pass
+            self._worker.request_cancel()
             return
 
-        raw = self.input_box.get("1.0", "end-1c")
+        raw = self.command_editor.toPlainText()
         self.command_analysis = analyze_command(raw)
+
         if not self.command_analysis["normalized"]:
-            self.action_meta_var.set("Paste a curl command before executing.")
+            self.action_meta.setText("Paste a curl command before executing.")
             self._sync_ui_state()
             return
 
@@ -1350,106 +1663,242 @@ class CurlSenderApp:
             self._clear_output()
             error = self.command_analysis["error"]
             line_hint = self.command_analysis["error_line"]
-            if line_hint is not None:
-                self._append(f"Parse error: {error} - unclosed quote opens on line {line_hint}.\n")
-            else:
-                self._append(f"Parse error: {error}\n")
+            msg = f"Parse error: {error}" + (f" - unclosed quote opens on line {line_hint}.\n" if line_hint else "\n")
+            self._append_output(msg)
             self.last_exit_code = None
             self.last_elapsed = None
             self._set_run_state("parse error", action_meta="Execution blocked by a parse error.")
             return
 
-        args = ["curl", *self.command_analysis["args"]]  # type: ignore[list-item]
-        self._save_last(raw)
-        self.cancel_requested = False
+        write_cached_command(raw)
+        self.command_restored = False
         self._clear_output()
+        self.cancel_requested = False
         self.last_exit_code = None
         self.last_elapsed = None
+        self._bytes_received = 0
         self.run_started_at = time.monotonic()
         self._set_run_state("running", action_meta="Streaming raw output. Use Execute again or Esc to cancel.")
-        self._tick_elapsed()
+        self.elapsed_timer.start()
 
-        threading.Thread(target=self._run, args=(args,), daemon=True).start()
+        self._worker_thread = QThread(self)
+        self._worker = CurlRunWorker(list(self.command_analysis["args"]))
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.chunk.connect(self._on_worker_chunk)
+        self._worker.failed.connect(self._on_worker_failed)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._worker.failed.connect(self._worker_thread.quit)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker_thread.finished.connect(self._cleanup_worker)
+        self._worker_thread.start()
+
+    @Slot(str, int)
+    def _on_worker_chunk(self, text: str, byte_count: int) -> None:
+        self._bytes_received += byte_count
+        self._append_output(text)
+        self._sync_ui_state()
+
+    @Slot(str)
+    def _on_worker_failed(self, message: str) -> None:
+        self.elapsed_timer.stop()
+        self._append_output(f"Error: {message}\n")
+        self.last_exit_code = None
+        self.last_elapsed = None
+        self.run_started_at = None
+        self.cancel_requested = False
+        self._set_run_state("error", action_meta="curl could not be started. Inspect the signal stream.")
+        if self._close_after_finish:
+            self._allow_close = True
+            self.close()
+
+    @Slot(int, float, bool, int)
+    def _on_worker_finished(self, return_code: int, elapsed: float, cancelled: bool, total_bytes: int) -> None:
+        self.elapsed_timer.stop()
+        self.last_exit_code = return_code
+        self.last_elapsed = elapsed
+        self.run_started_at = None
+        self._bytes_received = max(self._bytes_received, total_bytes)
+        if cancelled:
+            self._append_output(f"\n[cancelled with exit {return_code} in {elapsed:.2f}s]\n")
+            self._set_run_state("cancelled", action_meta="Execution stopped after a cancel request.")
+        else:
+            self._append_output(f"\n[exit {return_code} in {elapsed:.2f}s]\n")
+            self._set_run_state("done", action_meta="Execution finished. Raw output preserved in the stream.")
+        self.cancel_requested = False
+        if self._close_after_finish:
+            self._allow_close = True
+            self.close()
+
+    def _cleanup_worker(self) -> None:
+        if self._worker is not None:
+            self._worker.deleteLater()
+        if self._worker_thread is not None:
+            self._worker_thread.deleteLater()
+        self._worker = None
+        self._worker_thread = None
 
     def _tick_elapsed(self) -> None:
         if self.run_state not in {"running", "cancelling"} or self.run_started_at is None:
+            self.elapsed_timer.stop()
             return
-        elapsed = time.monotonic() - self.run_started_at
-        self.elapsed_var.set(f"{elapsed:.2f}s")
-        self.stream_title_var.set(f"Signal Stream | elapsed {self.elapsed_var.get()}")
-        self._sync_badge_colors()
-        self.root.after(150, self._tick_elapsed)
-
-    def _run(self, args: list[str]) -> None:
-        start = time.monotonic()
-        try:
-            self.proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except FileNotFoundError:
-            self.root.after(
-                0,
-                self._finish_error,
-                "'curl' not found on PATH. Windows 10 (1803+) and Windows 11 ship curl.exe in System32.",
-            )
-            return
-        except OSError as exc:
-            self.root.after(0, self._finish_error, str(exc))
-            return
-
-        assert self.proc.stdout is not None
-        for line in self.proc.stdout:
-            self.root.after(0, self._append, line)
-        self.proc.wait()
-        elapsed = time.monotonic() - start
-        rc = self.proc.returncode
-        self.root.after(0, self._finish_ok, rc, elapsed)
-
-    def _finish_ok(self, rc: int, elapsed: float) -> None:
-        self.last_exit_code = rc
-        self.last_elapsed = elapsed
-        self.elapsed_var.set(f"{elapsed:.2f}s")
-
-        if self.cancel_requested and rc != 0:
-            self._append(f"\n[cancelled with exit {rc} in {elapsed:.2f}s]\n")
-            self._set_run_state("cancelled", action_meta="Execution stopped after a cancel request.")
-        else:
-            self._append(f"\n[exit {rc} in {elapsed:.2f}s]\n")
-            self._set_run_state("done", action_meta="Execution finished. Raw output preserved in the stream.")
-
-        self.execute_btn.configure(text="Execute")
-        self.cancel_requested = False
-        self.proc = None
-        self.run_started_at = None
         self._sync_ui_state()
 
-    def _finish_error(self, msg: str) -> None:
-        self._append(f"Error: {msg}\n")
-        self.last_exit_code = None
-        self.last_elapsed = None
-        self.run_started_at = None
-        self.cancel_requested = False
-        self.proc = None
-        self._set_run_state("error", action_meta="curl could not be started. Inspect the signal stream.")
+    def handle_escape(self) -> None:
+        if self.find_bar.isVisible():
+            self.hide_find_bar()
+            return
+        if self.run_state in {"running", "cancelling"} and self._worker is not None:
+            self.on_execute()
+
+    def begin_title_drag(self, global_pos: QPoint) -> None:
+        if self.isMaximized():
+            return
+        handle = self.windowHandle()
+        if handle is not None and handle.startSystemMove():
+            return
+        self._drag_origin = global_pos
+        self._drag_start_frame = self.frameGeometry().topLeft()
+
+    def toggle_maximized(self) -> None:
+        self.showNormal() if self.isMaximized() else self.showMaximized()
+        QTimer.singleShot(0, self._apply_window_chrome)
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if isinstance(watched, QWidget) and (watched is self or self.isAncestorOf(watched)):
+            if event.type() in {QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove,
+                                 QEvent.Type.MouseButtonRelease, QEvent.Type.Leave}:
+                return self._handle_window_mouse_event(event)
+        return super().eventFilter(watched, event)
+
+    def _handle_window_mouse_event(self, event) -> bool:
+        if self.isMaximized():
+            if event.type() == QEvent.Type.MouseMove and not self._drag_origin:
+                self.unsetCursor()
+            return False
+
+        if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            edges = self._edges_for_global_pos(event.globalPosition().toPoint())
+            if edges != Qt.Edges():
+                handle = self.windowHandle()
+                if handle is not None and handle.startSystemResize(edges):
+                    return True
+                self._manual_resize_edges = edges
+                self._manual_resize_origin = event.globalPosition().toPoint()
+                self._manual_resize_geometry = self.geometry()
+                return True
+
+        if event.type() == QEvent.Type.MouseMove:
+            global_pos = event.globalPosition().toPoint()
+            if self._drag_origin is not None and self._drag_start_frame is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                self.move(self._drag_start_frame + global_pos - self._drag_origin)
+                return True
+            if self._manual_resize_origin is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                self._apply_manual_resize(global_pos)
+                return True
+            self._update_resize_cursor(global_pos)
+
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            self._drag_origin = None
+            self._drag_start_frame = None
+            self._manual_resize_origin = None
+            self._manual_resize_edges = Qt.Edges()
+            return False
+
+        if event.type() == QEvent.Type.Leave and self._manual_resize_origin is None:
+            self.unsetCursor()
+        return False
+
+    def _edges_for_global_pos(self, global_pos: QPoint) -> Qt.Edges:
+        local = self.mapFromGlobal(global_pos)
+        s = self.surface.geometry()
+        left = s.left() <= local.x() <= s.left() + _RESIZE_MARGIN
+        right = s.right() - _RESIZE_MARGIN <= local.x() <= s.right()
+        top = s.top() <= local.y() <= s.top() + _RESIZE_MARGIN
+        bottom = s.bottom() - _RESIZE_MARGIN <= local.y() <= s.bottom()
+        edges = Qt.Edges()
+        if left: edges |= Qt.Edge.LeftEdge
+        if right: edges |= Qt.Edge.RightEdge
+        if top: edges |= Qt.Edge.TopEdge
+        if bottom: edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def _update_resize_cursor(self, global_pos: QPoint) -> None:
+        edges = self._edges_for_global_pos(global_pos)
+        if edges in {Qt.Edge.LeftEdge, Qt.Edge.RightEdge}:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif edges in {Qt.Edge.TopEdge, Qt.Edge.BottomEdge}:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif edges in {Qt.Edge.TopEdge | Qt.Edge.LeftEdge, Qt.Edge.BottomEdge | Qt.Edge.RightEdge}:
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif edges in {Qt.Edge.TopEdge | Qt.Edge.RightEdge, Qt.Edge.BottomEdge | Qt.Edge.LeftEdge}:
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        else:
+            self.unsetCursor()
+
+    def _apply_manual_resize(self, global_pos: QPoint) -> None:
+        if self._manual_resize_origin is None:
+            return
+        g = self._manual_resize_geometry
+        d = global_pos - self._manual_resize_origin
+        left, top, right, bottom = g.left(), g.top(), g.right(), g.bottom()
+        if self._manual_resize_edges & Qt.Edge.LeftEdge: left += d.x()
+        if self._manual_resize_edges & Qt.Edge.RightEdge: right += d.x()
+        if self._manual_resize_edges & Qt.Edge.TopEdge: top += d.y()
+        if self._manual_resize_edges & Qt.Edge.BottomEdge: bottom += d.y()
+        new_w = max(right - left + 1, self.minimumWidth())
+        new_h = max(bottom - top + 1, self.minimumHeight())
+        if self._manual_resize_edges & Qt.Edge.LeftEdge: left = right - new_w + 1
+        if self._manual_resize_edges & Qt.Edge.TopEdge: top = bottom - new_h + 1
+        self.setGeometry(left, top, new_w, new_h)
+
+    def request_close(self) -> None:
+        dialog = ExitDialog(self, self.colors, running=self.run_state in {"running", "cancelling"})
+        dialog.move(self.frameGeometry().center() - dialog.rect().center())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if self.run_state in {"running", "cancelling"} and self._worker is not None:
+            self._close_after_finish = True
+            if self.run_state != "cancelling":
+                self.on_execute()
+            return
+        self._allow_close = True
+        self.close()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._allow_close:
+            event.ignore()
+            self.request_close()
+            return
+        self._save_window_state()
+        super().closeEvent(event)
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            QTimer.singleShot(0, self._apply_window_chrome)
+
+    def _apply_window_chrome(self) -> None:
+        if (outer := self.layout()) is None:
+            return
+        margin = 0 if self.isMaximized() else _WINDOW_MARGIN
+        outer.setContentsMargins(margin, margin, margin, margin)
+        self._shadow_effect.setEnabled(not self.isMaximized())
+        self.setStyleSheet(self._build_stylesheet())
 
 
-def main() -> None:
-    if _IS_WINDOWS:
-        try:
-            _SHELL32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
-        except OSError:
-            pass
-    root = tk.Tk()
-    CurlSenderApp(root)
-    root.mainloop()
+def main() -> int:
+    _set_app_user_model_id(_APP_ID)
+    app = QApplication(sys.argv)
+    app.setApplicationName("cURLsender")
+    app.setOrganizationName(_SETTINGS_ORGANIZATION)
+    icon = _build_app_icon()
+    app.setWindowIcon(icon)
+    window = ConsoleSignalWindow()
+    window.setWindowIcon(icon)
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
