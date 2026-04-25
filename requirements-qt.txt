@@ -1,0 +1,2 @@
+# Runtime minimo da V2 em Qt.
+PySide6>=6.6,<7
