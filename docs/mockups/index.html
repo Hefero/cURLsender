@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>cURLsender Mockups</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --panel: rgba(255, 252, 246, 0.84);
+        --panel-strong: rgba(255, 251, 243, 0.96);
+        --text: #1e2228;
+        --muted: #657180;
+        --line: rgba(30, 34, 40, 0.12);
+        --accent: #135d66;
+        --accent-soft: rgba(19, 93, 102, 0.12);
+        --good: #23784f;
+        --warn: #a26411;
+        --bad: #a33e3e;
+        --shadow: 0 18px 50px rgba(28, 34, 40, 0.11);
+        --radius: 24px;
+        --mono: "Cascadia Code", "Consolas", monospace;
+        --sans: "Segoe UI", "Helvetica Neue", sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        font-family: var(--sans);
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(19, 93, 102, 0.18), transparent 35%),
+          radial-gradient(circle at bottom right, rgba(197, 137, 54, 0.18), transparent 28%),
+          linear-gradient(135deg, #e5dfd0 0%, #f4ecdb 52%, #ece4d4 100%);
+      }
+
+      .shell {
+        min-height: 100vh;
+        display: grid;
+        grid-template-columns: 300px minmax(0, 1fr);
+      }
+
+      .sidebar {
+        border-right: 1px solid var(--line);
+        background: rgba(248, 244, 236, 0.82);
+        backdrop-filter: blur(14px);
+        padding: 28px 22px;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-weight: 700;
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      h1 { margin: 18px 0 10px; font-size: 34px; line-height: 1; }
+      .lede, .side-note, .title-block p, .mockup-btn span, .summary-card ul, .callout p, .meta, .brand p, .summary-grid p { color: var(--muted); }
+      .lede, .side-note, .callout p, .summary-card ul { line-height: 1.6; }
+      .mockup-list { display: grid; gap: 12px; margin: 26px 0 30px; }
+
+      .mockup-btn {
+        width: 100%;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.68);
+        border-radius: 18px;
+        padding: 14px;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .mockup-btn.active {
+        border-color: rgba(19, 93, 102, 0.35);
+        background: rgba(255, 255, 255, 0.94);
+      }
+
+      .mockup-btn strong { display: block; font-size: 15px; margin-bottom: 3px; }
+
+      .summary-card {
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 16px;
+        background: rgba(255, 255, 255, 0.62);
+      }
+
+      .summary-card h2 { margin: 0 0 10px; font-size: 16px; }
+      .content { padding: 26px; }
+
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: end;
+        margin-bottom: 18px;
+      }
+
+      .title-block h2 { margin: 0; font-size: 24px; }
+      .pill-row, .preflight, .btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
+
+      .pill, .chip {
+        padding: 8px 11px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .pill.good { background: rgba(35, 120, 79, 0.12); color: var(--good); }
+      .pill.warn { background: rgba(162, 100, 17, 0.12); color: var(--warn); }
+      .pill.bad { background: rgba(163, 62, 62, 0.12); color: var(--bad); }
+      .pill.neutral, .chip { background: rgba(19, 93, 102, 0.09); color: var(--accent); }
+
+      .mockup {
+        display: none;
+        border-radius: var(--radius);
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.6);
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        min-height: 760px;
+        position: relative;
+      }
+
+      .mockup.active { display: block; }
+      .window { min-height: 760px; padding: 20px; background: var(--panel); }
+
+      .window.dark {
+        background:
+          radial-gradient(circle at top left, rgba(55, 80, 90, 0.65), transparent 35%),
+          linear-gradient(160deg, #11161a 0%, #191f24 55%, #14191e 100%);
+        color: #eff3f6;
+      }
+
+      .app-frame {
+        border-radius: 26px;
+        background: var(--panel-strong);
+        border: 1px solid var(--line);
+        padding: 18px;
+        display: grid;
+        gap: 16px;
+      }
+
+      .window.dark .app-frame {
+        background: rgba(22, 28, 33, 0.86);
+        border-color: rgba(255, 255, 255, 0.08);
+      }
+
+      .header, .panel, .actionbar, .summary, .toolbar {
+        border-radius: 18px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.68);
+      }
+
+      .window.dark .header,
+      .window.dark .panel,
+      .window.dark .actionbar,
+      .window.dark .summary,
+      .window.dark .toolbar {
+        background: rgba(255, 255, 255, 0.04);
+        border-color: rgba(255, 255, 255, 0.08);
+      }
+
+      .header, .actionbar, .toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 14px;
+      }
+
+      .brand { display: flex; align-items: center; gap: 12px; }
+
+      .logo {
+        width: 40px;
+        height: 40px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, var(--accent), #2f8f9d);
+        color: white;
+        display: grid;
+        place-items: center;
+        font-weight: 800;
+      }
+
+      .brand h3, .panel h4, .summary h4 { margin: 0; }
+      .panel, .summary { padding: 14px; }
+      .panel h4, .summary h4 { margin-bottom: 10px; font-size: 14px; letter-spacing: 0.03em; text-transform: uppercase; }
+
+      .editor {
+        display: grid;
+        grid-template-columns: 42px minmax(0, 1fr);
+        gap: 12px;
+        border-radius: 14px;
+        padding: 14px 0;
+        background: rgba(17, 22, 26, 0.94);
+        color: #d8e1e8;
+        font-family: var(--mono);
+        font-size: 13px;
+        min-height: 190px;
+      }
+
+      .window.dark .editor { background: rgba(10, 13, 16, 0.86); }
+      .lines { padding-left: 14px; text-align: right; color: rgba(216, 225, 232, 0.35); user-select: none; }
+      .code, .terminal { white-space: pre-wrap; line-height: 1.58; }
+      .code { padding-right: 16px; }
+
+      .btn { border: 0; border-radius: 12px; padding: 11px 14px; font-weight: 700; cursor: default; }
+      .btn.primary { background: linear-gradient(135deg, var(--accent), #2f8f9d); color: white; }
+      .btn.secondary { background: rgba(19, 93, 102, 0.09); color: var(--accent); }
+      .btn.ghost { background: rgba(30, 34, 40, 0.06); color: var(--text); }
+      .window.dark .btn.ghost { background: rgba(255, 255, 255, 0.08); color: #eff3f6; }
+
+      .summary-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .metric { border-radius: 14px; background: rgba(19, 93, 102, 0.06); padding: 12px; }
+      .window.dark .metric { background: rgba(255, 255, 255, 0.05); }
+      .metric strong { display: block; font-size: 18px; margin-top: 4px; }
+
+      .output-frame { display: grid; gap: 10px; }
+
+      .terminal {
+        border-radius: 16px;
+        background: rgba(16, 20, 24, 0.98);
+        min-height: 260px;
+        padding: 16px;
+        font-family: var(--mono);
+        font-size: 13px;
+        color: #dce4ea;
+      }
+
+      .terminal .ok { color: #7ee2a8; }
+      .terminal .warn { color: #ffd07d; }
+      .terminal .bad { color: #ff8f8f; }
+      .two-col { display: grid; grid-template-columns: minmax(360px, 0.94fr) minmax(420px, 1.06fr); gap: 16px; }
+      .reader-grid { display: grid; gap: 16px; }
+
+      .callout {
+        position: absolute;
+        right: 20px;
+        bottom: 20px;
+        max-width: 300px;
+        border-radius: 18px;
+        padding: 14px 15px;
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(19, 93, 102, 0.16);
+      }
+
+      .callout strong { display: block; margin-bottom: 6px; }
+
+      .ribbon {
+        display: inline-flex;
+        padding: 8px 11px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        color: rgba(239, 243, 246, 0.78);
+        font-size: 12px;
+      }
+
+      @media (max-width: 1100px) {
+        .shell { grid-template-columns: 1fr; }
+        .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+        .two-col, .summary-grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="eyebrow">Consensus Gallery</div>
+        <h1>cURLsender</h1>
+        <p class="lede">Five interactive mockup directions based on a joint UI, PM, and UX proposal. All of them preserve the same thesis: this stays a faithful `curl` runner, not an API client.</p>
+        <div class="mockup-list">
+          <button class="mockup-btn active" data-target="baseline"><strong>Baseline Refined</strong><span>Safest evolution of the current single-window flow.</span></button>
+          <button class="mockup-btn" data-target="split"><strong>Split Operator</strong><span>Balanced command and output views for active debugging.</span></button>
+          <button class="mockup-btn" data-target="reader"><strong>Reader First</strong><span>Output gets the spotlight for long response inspection.</span></button>
+          <button class="mockup-btn" data-target="console"><strong>Console Signal</strong><span>Live execution feel with stronger operational feedback.</span></button>
+          <button class="mockup-btn" data-target="calm"><strong>Calm Lab</strong><span>Recommended direction with precise hierarchy and calm tone.</span></button>
+        </div>
+        <div class="summary-card">
+          <h2>Consensus structure</h2>
+          <ul>
+            <li>Command editor</li>
+            <li>Preflight hints</li>
+            <li>Execute and validate actions</li>
+            <li>Execution summary</li>
+            <li>Raw output with reading tools</li>
+          </ul>
+        </div>
+        <p class="side-note">Open this file locally in a browser and switch between the concepts from the left sidebar.</p>
+      </aside>
+
+      <main class="content">
+        <div class="topbar">
+          <div class="title-block">
+            <h2>Interactive product directions</h2>
+            <p>Same product structure, five different visual and ergonomic interpretations.</p>
+          </div>
+          <div class="pill-row">
+            <div class="pill good">Paste</div>
+            <div class="pill neutral">Run</div>
+            <div class="pill warn">Validate</div>
+            <div class="pill bad">Never becomes Postman</div>
+          </div>
+        </div>
+
+        <section class="mockup active" id="baseline">
+          <div class="window">
+            <div class="app-frame reader-grid">
+              <div class="header">
+                <div class="brand">
+                  <div class="logo">c</div>
+                  <div>
+                    <h3>cURLsender</h3>
+                    <p>Paste, run, and read exactly what curl emits.</p>
+                  </div>
+                </div>
+                <div class="pill good">Ready to run</div>
+              </div>
+              <div class="panel">
+                <h4>Command</h4>
+                <div class="editor">
+                  <div class="lines">1<br />2<br />3<br />4</div>
+                  <div class="code">curl -X POST https://api.example.dev/orders \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk_live_...' \
+  -d '{"status":"draft","total":128.90}'</div>
+                </div>
+                <div class="preflight">
+                  <div class="chip">POST</div>
+                  <div class="chip">api.example.dev</div>
+                  <div class="chip">2 headers</div>
+                  <div class="chip">JSON body detected</div>
+                </div>
+              </div>
+              <div class="actionbar">
+                <div class="btn-row">
+                  <button class="btn primary">Execute</button>
+                  <button class="btn secondary">Validate</button>
+                  <button class="btn ghost">Clear output</button>
+                  <button class="btn ghost">Clear command</button>
+                </div>
+                <p class="meta">Last command restored</p>
+              </div>
+              <div class="summary">
+                <h4>Execution Summary</h4>
+                <div class="summary-grid">
+                  <div class="metric"><p>Status</p><strong>Idle</strong></div>
+                  <div class="metric"><p>curl</p><strong>Detected</strong></div>
+                  <div class="metric"><p>Last run</p><strong>0.72s</strong></div>
+                  <div class="metric"><p>Exit code</p><strong>0</strong></div>
+                </div>
+              </div>
+              <div class="panel output-frame">
+                <div class="toolbar">
+                  <h4>Response Stream</h4>
+                  <div class="btn-row">
+                    <button class="btn ghost">Wrap on</button>
+                    <button class="btn ghost">Auto-scroll</button>
+                    <button class="btn ghost">Find</button>
+                    <button class="btn ghost">Copy all</button>
+                  </div>
+                </div>
+                <div class="terminal">{
+  "id": "ord_8471",
+  "status": "draft",
+  "total": 128.9
+}
+
+<span class="ok">[exit 0 in 0.72s]</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="callout"><strong>Why this exists</strong><p>This is the safest path: it keeps the familiar vertical flow and improves clarity, safety, and reading comfort.</p></div>
+        </section>
+
+        <section class="mockup" id="split">
+          <div class="window">
+            <div class="app-frame">
+              <div class="header">
+                <div class="brand">
+                  <div class="logo">c</div>
+                  <div>
+                    <h3>cURLsender / Split Operator</h3>
+                    <p>For active debugging loops where input and output compete equally.</p>
+                  </div>
+                </div>
+                <div class="pill warn">Running...</div>
+              </div>
+              <div class="two-col">
+                <div class="panel">
+                  <h4>Command</h4>
+                  <div class="editor" style="min-height: 470px;">
+                    <div class="lines">1<br />2<br />3<br />4<br />5<br />6</div>
+                    <div class="code">curl -X POST https://api.example.dev/orders \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk_live_...' \
+  -H 'x-request-id: dbg-338' \
+  -d '{"status":"draft","items":[{"sku":"A1","qty":2}]}' \
+  --verbose</div>
+                  </div>
+                  <div class="preflight">
+                    <div class="chip">POST</div>
+                    <div class="chip">Verbose mode</div>
+                    <div class="chip">Body present</div>
+                    <div class="chip">Auth header detected</div>
+                  </div>
+                </div>
+                <div style="display:grid; gap:16px;">
+                  <div class="summary">
+                    <h4>Execution Summary</h4>
+                    <div class="summary-grid">
+                      <div class="metric"><p>Status</p><strong>Running</strong></div>
+                      <div class="metric"><p>Elapsed</p><strong>1.14s</strong></div>
+                      <div class="metric"><p>Host</p><strong>example.dev</strong></div>
+                      <div class="metric"><p>Safety</p><strong>Token cached</strong></div>
+                    </div>
+                  </div>
+                  <div class="actionbar">
+                    <div class="btn-row">
+                      <button class="btn primary">Cancel request</button>
+                      <button class="btn secondary">Validate</button>
+                    </div>
+                    <p class="meta">The output stays raw. Summary is separate.</p>
+                  </div>
+                  <div class="panel output-frame">
+                    <div class="toolbar">
+                      <h4>Output</h4>
+                      <div class="btn-row">
+                        <button class="btn ghost">Jump to end</button>
+                        <button class="btn ghost">Find</button>
+                        <button class="btn ghost">Copy all</button>
+                      </div>
+                    </div>
+                    <div class="terminal">* Connected to api.example.dev
+&gt; POST /orders HTTP/1.1
+&gt; Content-Type: application/json
+&gt; Authorization: Bearer ********
+&lt; HTTP/1.1 202 Accepted
+&lt; x-trace-id: req_7b2a
+
+{"queue":"ingest","accepted":true}
+
+<span class="warn">[running - stream active]</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="callout"><strong>Why this exists</strong><p>This version is for operators and debuggers who want to compare request and response side by side without changing the model.</p></div>
+        </section>
+
+        <section class="mockup" id="reader">
+          <div class="window">
+            <div class="app-frame reader-grid">
+              <div class="header">
+                <div class="brand">
+                  <div class="logo">c</div>
+                  <div>
+                    <h3>cURLsender / Reader First</h3>
+                    <p>Designed for the moments when output analysis dominates the session.</p>
+                  </div>
+                </div>
+                <div class="pill bad">Finished with errors</div>
+              </div>
+              <div class="actionbar">
+                <div class="btn-row">
+                  <button class="btn primary">Re-run</button>
+                  <button class="btn secondary">Validate</button>
+                  <button class="btn ghost">Edit command</button>
+                </div>
+                <p class="meta">Error parsing is separated from server response errors.</p>
+              </div>
+              <div class="summary">
+                <h4>Execution Summary</h4>
+                <div class="summary-grid">
+                  <div class="metric"><p>Exit code</p><strong>22</strong></div>
+                  <div class="metric"><p>HTTP</p><strong>401</strong></div>
+                  <div class="metric"><p>Duration</p><strong>0.48s</strong></div>
+                  <div class="metric"><p>Hint</p><strong>Auth expired</strong></div>
+                </div>
+              </div>
+              <div class="two-col" style="grid-template-columns: minmax(290px, 0.75fr) minmax(480px, 1.25fr);">
+                <div class="panel">
+                  <h4>Command Snapshot</h4>
+                  <div class="editor" style="min-height: 420px;">
+                    <div class="lines">1<br />2<br />3<br />4</div>
+                    <div class="code">curl https://api.example.dev/orders \
+  -H 'Authorization: Bearer old_token' \
+  -H 'Accept: application/json' \
+  --fail-with-body</div>
+                  </div>
+                  <div class="preflight">
+                    <div class="chip">GET</div>
+                    <div class="chip">Fail with body</div>
+                    <div class="chip">Auth header</div>
+                  </div>
+                </div>
+                <div class="panel output-frame">
+                  <div class="toolbar">
+                    <h4>Response Stream</h4>
+                    <div class="btn-row">
+                      <button class="btn ghost">Wrap off</button>
+                      <button class="btn ghost">Follow output</button>
+                      <button class="btn ghost">Copy all</button>
+                    </div>
+                  </div>
+                  <div class="terminal"><span class="bad">curl: (22) The requested URL returned error: 401</span>
+{
+  "error": "invalid_token",
+  "message": "The bearer token expired at 2026-04-24T13:10:00Z",
+  "trace_id": "req_0f1c"
+}
+
+<span class="bad">[exit 22 in 0.48s]</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="callout"><strong>Why this exists</strong><p>This one optimizes for reading and interpretation, especially when the response is the real object of work.</p></div>
+        </section>
+
+        <section class="mockup" id="console">
+          <div class="window dark">
+            <div class="app-frame">
+              <div class="header">
+                <div class="brand">
+                  <div class="logo" style="background: linear-gradient(135deg, #3db497, #5f9eff);">c</div>
+                  <div>
+                    <h3>cURLsender / Console Signal</h3>
+                    <p>High-contrast live execution mode with strong operational feel.</p>
+                  </div>
+                </div>
+                <div class="ribbon">Live stream • cancel available • curl detected</div>
+              </div>
+              <div class="two-col">
+                <div style="display:grid; gap:16px;">
+                  <div class="panel">
+                    <h4>Command Deck</h4>
+                    <div class="editor" style="min-height: 360px;">
+                      <div class="lines">1<br />2<br />3<br />4<br />5</div>
+                      <div class="code">curl https://api.example.dev/reports/export \
+  -H 'Authorization: Bearer sk_live_...' \
+  -G --data-urlencode 'from=2026-04-01' \
+  --data-urlencode 'to=2026-04-24' \
+  --output report.csv</div>
+                    </div>
+                    <div class="preflight">
+                      <div class="chip">GET</div>
+                      <div class="chip">Output file</div>
+                      <div class="chip">Large transfer risk</div>
+                    </div>
+                  </div>
+                  <div class="actionbar">
+                    <div class="btn-row">
+                      <button class="btn primary">Cancel request</button>
+                      <button class="btn secondary">Validate only</button>
+                      <button class="btn ghost">Clear output</button>
+                    </div>
+                    <p class="meta">Use Esc to cancel current execution.</p>
+                  </div>
+                </div>
+                <div style="display:grid; gap:16px;">
+                  <div class="summary">
+                    <h4>Execution Summary</h4>
+                    <div class="summary-grid">
+                      <div class="metric"><p>Status</p><strong>Streaming</strong></div>
+                      <div class="metric"><p>Elapsed</p><strong>4.92s</strong></div>
+                      <div class="metric"><p>Rate</p><strong>3.2 MB/s</strong></div>
+                      <div class="metric"><p>Exit</p><strong>Pending</strong></div>
+                    </div>
+                  </div>
+                  <div class="panel output-frame">
+                    <div class="toolbar">
+                      <h4>Signal Stream</h4>
+                      <div class="btn-row">
+                        <button class="btn ghost">Find</button>
+                        <button class="btn ghost">Jump to end</button>
+                        <button class="btn ghost">Auto-scroll on</button>
+                      </div>
+                    </div>
+                    <div class="terminal">* Resolving api.example.dev...
+* Connected to api.example.dev (104.21.12.91)
+&gt; GET /reports/export?from=2026-04-01&amp;to=2026-04-24 HTTP/1.1
+&lt; HTTP/1.1 200 OK
+&lt; content-type: text/csv
+&lt; content-length: 1249831
+
+........ downloading ........
+........ writing report.csv ........
+
+<span class="warn">[stream active • press Esc to cancel]</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="callout"><strong>Why this exists</strong><p>This concept leans into execution confidence and real-time system feedback without adding product complexity.</p></div>
+        </section>
+
+        <section class="mockup" id="calm">
+          <div class="window">
+            <div class="app-frame">
+              <div class="header">
+                <div class="brand">
+                  <div class="logo">c</div>
+                  <div>
+                    <h3>cURLsender / Calm Lab</h3>
+                    <p>Recommended direction: measured, technical, calm, and precise.</p>
+                  </div>
+                </div>
+                <div class="pill neutral">Recommended</div>
+              </div>
+              <div class="two-col" style="grid-template-columns: minmax(380px, 0.95fr) minmax(420px, 1.05fr);">
+                <div style="display:grid; gap:16px;">
+                  <div class="panel">
+                    <h4>Command</h4>
+                    <div class="editor" style="min-height: 410px;">
+                      <div class="lines">1<br />2<br />3<br />4<br />5</div>
+                      <div class="code">curl -X PATCH https://api.example.dev/orders/ord_8471 \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk_live_...' \
+  -d '{"status":"confirmed","source":"dashboard"}' \
+  --fail-with-body</div>
+                    </div>
+                    <div class="preflight">
+                      <div class="chip">PATCH</div>
+                      <div class="chip">1 JSON body</div>
+                      <div class="chip">Authorization detected</div>
+                      <div class="chip">fail-with-body</div>
+                    </div>
+                  </div>
+                  <div class="actionbar">
+                    <div class="btn-row">
+                      <button class="btn primary">Execute</button>
+                      <button class="btn secondary">Validate</button>
+                      <button class="btn ghost">Open snippet</button>
+                    </div>
+                    <p class="meta">Last command restored with sensitive-header warning.</p>
+                  </div>
+                </div>
+                <div style="display:grid; gap:16px;">
+                  <div class="summary">
+                    <h4>Execution Summary</h4>
+                    <div class="summary-grid">
+                      <div class="metric"><p>Status</p><strong>Ready</strong></div>
+                      <div class="metric"><p>Host</p><strong>example.dev</strong></div>
+                      <div class="metric"><p>Warnings</p><strong>1</strong></div>
+                      <div class="metric"><p>Persist</p><strong>On</strong></div>
+                    </div>
+                  </div>
+                  <div class="panel">
+                    <h4>Warnings</h4>
+                    <div class="summary-grid" style="grid-template-columns: 1fr;">
+                      <div class="metric">
+                        <p>Cached secret awareness</p>
+                        <strong>Authorization header will be stored locally</strong>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="panel output-frame">
+                    <div class="toolbar">
+                      <h4>Raw Output</h4>
+                      <div class="btn-row">
+                        <button class="btn ghost">Wrap on</button>
+                        <button class="btn ghost">Find</button>
+                        <button class="btn ghost">Copy</button>
+                        <button class="btn ghost">Save output</button>
+                      </div>
+                    </div>
+                    <div class="terminal">Ready to execute.
+
+Preflight:
+- syntax looks valid
+- curl found on PATH
+- command contains 1 sensitive header
+- expected method: PATCH
+- target host: api.example.dev
+
+<span class="ok">No request has run yet.</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="callout"><strong>Why this is recommended</strong><p>It keeps the mental model simple, introduces trust-building guidance, and feels intentionally designed without drifting toward a full API platform.</p></div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const buttons = document.querySelectorAll(".mockup-btn");
+      const sections = document.querySelectorAll(".mockup");
+
+      buttons.forEach((button) => {
+        button.addEventListener("click", () => {
+          const target = button.dataset.target;
+          buttons.forEach((item) => item.classList.remove("active"));
+          sections.forEach((section) => section.classList.remove("active"));
+          button.classList.add("active");
+          document.getElementById(target).classList.add("active");
+        });
+      });
+    </script>
+  </body>
+</html>
